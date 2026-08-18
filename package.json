@@ -1,0 +1,19 @@
+{
+  "name": "openclaw-chat-interceptor",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Intercept chat messages before the agent replies, hand them to a per-room script first, and only fall through to the AI when the script cannot handle them.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.15"
+  },
+  "scripts": {
+    "test": "node --test test/hook.test.js"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.7.1-0"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.js"]
+  }
+}
