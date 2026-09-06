@@ -147,8 +147,11 @@ plugin 本身**不含任何領域邏輯**，只做路由：
 
 ```
 selectRoute(ctx, config)        依序找第一個 channel + target 都對上的 route
-  ↓ 沒有 → return undefined（整輪給 AI）
-body 以 ISSUE 開頭？ → 寫進 issueLogFile，handled 但不回話（見 2.7）
+  ↓
+body 是 /tap？ → 叫起 AI harness，handled（見 2.9；這一步不需要 route）
+  ↓ 不是
+  ↓ 沒有 route → return undefined（整輪給 AI）
+body 是 /aside？ → 寫進 asideLogFile，handled 但不回話（見 2.7；不需要 route）
   ↓ 不是
 spawn route.command，stdin 餵 JSON payload
   ↓
@@ -157,7 +160,16 @@ exit 20 → return undefined（給 AI）
 其他    → 依 route.onError 決定 handled 或 passthrough
 ```
 
-四個刻意的設計決定：
+五個刻意的設計決定：
+
+- **route 可以只寫 `project`，要跑什麼每次派工時才推。** OpenClaw 沒有「給我一支
+  script、我來找直譯器」這種機制——plugin SDK 的執行介面是
+  `runPluginCommandWithTimeout({ argv, … })`，argv 第一格就得是可執行檔。所以那個
+  責任只能有人扛，而扛進設定檔的代價是：`C:/Program Files/nodejs/node.exe` 這種東西
+  散在每一條 route 裡，換個 node 版本、重裝一次 uv 就悄悄失效。改成每次派工才解析：
+  `.mjs`/`.js`/`.cjs` 用 gateway 自己這支 node（`process.execPath`，不可能錯），
+  `.py` 當場找 `uv`（沒有才退而找 `python`）。設定檔裡不再有任何這台機器專屬的東西。
+  約定不合用時 `command` 仍在，那是逃生口。
 
 - **`target` 或 `command` 沒設好的 route 直接略過。** 寧可多花 token，也不要亂攔。
 - **script 失敗預設算 `handled`。** 若失敗時 `return undefined`，同一句話會再送給 AI，
@@ -174,6 +186,7 @@ exit 20 → return undefined（給 AI）
 
 | | |
 |---|---|
+| 位置 | `<projectsDir>/<project>/scripts/intercept.{mjs,js,cjs,py}`（用 `project` route 時） |
 | stdin | JSON `{ body, channel, target, senderId, sessionKey, agentId }` |
 | stdout | 要回給使用者的純文字；空的代表「處理掉但不回話」 |
 | exit `0` | 處理掉了 |
@@ -268,36 +281,39 @@ openclaw plugins inspect openclaw-chat-interceptor --runtime --json
 
 `typedHooks` 是空的就是沒接上；`diagnostics` 會直接寫出原因。
 
-### 2.7 ISSUE
+### 2.7 `/aside`
 
-`ISSUE ＿＿` 由 plugin 直接吃掉：不呼叫模型、不跑 script、不回話，
-只往 `issueLogFile` append 一行 `<當地時間> <JSON>`。
+`/aside ＿＿` 由 plugin 直接吃掉：不呼叫模型、不跑 script、不回話，
+只往 `asideLogFile` append 一行 `<當地時間> <JSON>`。
 
 ```js
-const ISSUE_RE = /^issue\b([\s\S]*)$/i;
+const ASIDE_RE = /^\/aside(?:@\S+)?(?![\w-])([\s\S]*)$/i;
 ```
 
 幾個刻意的決定：
 
-- **只認 `ISSUE` 這個開頭，關鍵字後面接什麼就原樣記什麼。** 標點不另外判斷：
-  `ISSUE:`、`ISSUE：` 本來就落在「開頭是 ISSUE」裡面，多寫一段判斷只是多一個
-  會壞的地方。字界（`\b`）則是必要的，否則 `issues are piling up` 這種
-  「一句話裡剛好有這個字」會被當成指令吃掉。
+- **名字取自戲劇的旁白。** 說出口、留在劇本裡，但台上其他角色聽不見——這不是比喻，
+  這就是定義。它曾經叫 `ISSUE`，但那個名字宣稱了「這是軟體的問題」，
+  而使用者留的話多半不是；他只是不想讓那句話被任何人處理。
 
-- **排在 script 前面。** 使用者抱怨的是「這個房間用起來怎樣」，不是給 script 的指令。
-  送過去只會被誤判成某條規則，甚至產生副作用。
-- **只在有 route 的房間生效。** 沒 route 的房間沒套用本 plugin，
-  攔下它等於偷走一句本來會有人回應的話。
+- **只認 `/aside` 這個開頭，後面接什麼就原樣記什麼。** 標點不另外判斷。
+  `(?![\w-])` 是必要的，否則 `/asidebar` 會被當成指令吃掉；
+  `(?:@\S+)?` 是因為 telegram 在群組裡會把指令寫成 `/aside@botname`。
+
+- **排在所有東西前面，而且每個房間的行為都一樣。** 有沒有 route、有沒有專案、
+  `debug` 開不開，都不影響。使用者要的是「我在這裡留一句，誰都不要理」；
+  這件事如果在某些房間會突然叫醒 AI，他每次開口前都得先想「這間算不算」，
+  那就不是一個他敢用的東西了。斜線指令也打不出意外，不必擔心誤攔。
 - **這是 plugin 的事，不是 script 的事。** 放進 script 就變成「每支 script 各自實作
   一次，而且各自可能忘記」；使用者要的是一個**在每個房間都一定成立**的約定。
 - **另開一個檔，不寫進 `logFile`。** 那個檔記的是異常（放行、出錯），
-  把使用者的抱怨堆進去等於把兩種完全不同的東西混在一起；而且 issue 不該因為
+  把使用者的抱怨堆進去等於把兩種完全不同的東西混在一起；而且它不該因為
   某人沒開 `debug` 就消失。一行一筆 JSON：多行原文照原樣保留，
   又不必自己發明跳脫規則。
 - **當地時間，不用 ISO。** 這個檔是拿來跟聊天室看到的時間、跟 `.tap` 的
   `viewed:` 對照的，同一個尺規才不必換算時區，比大小也直接字串比就好。
 - **寫失敗要回話。** 使用者要的是「記一下、不要有反應」，但「沒記到卻也沒反應」
-  就是把他的待辦默默弄丟了，所以那一則回 `ISSUE not recorded: …`。
+  就是把他的話默默弄丟了，所以那一則回 `aside not recorded: …`。
 
 ### 2.8 `/tap`：被攔掉的輸入怎麼還原
 
@@ -313,7 +329,7 @@ const ISSUE_RE = /^issue\b([\s\S]*)$/i;
 | 2 | `<sessionId>.jsonl`（含 `.reset.`／`.deleted.`） | 乾淨的 `role:user` 原文，但沒有 message id |
 | 3 | `agent/codex-home/sessions/**/rollout-*.jsonl` | runtime 的另一份副本，補 1 已被輪替掉的部分 |
 | 4 | `logFile`（要 `debug: true`） | **每一輪的下場**：攔下、放行、出錯 |
-| 5 | `issueLogFile` | `ISSUE`，只有這裡有 |
+| 5 | `asideLogFile` | `/aside`，只有這裡有 |
 
 1～3 都會有缺漏（session 輪替、context window 裁切），合併後才接近完整。
 同一則訊息可能同時出現在三個來源，工具用「第一行原文相同且時間相差 5 分鐘內」
@@ -327,12 +343,82 @@ message id**，不是 telegram 的 id。缺漏偵測若照著 id 範圍從頭數
 房間位置寫在各專案自己的 `.tap`（`channel` / `target` / `viewed` 三個欄位，
 不進版控）。細節見 [`skills/tap/SKILL.md`](../skills/tap/SKILL.md)。
 
+### 2.9 房間裡的 `/tap`
+
+2.8 那個 skill 要人走到終端機、切到專案目錄、叫起 harness、請它施展 `/tap`。
+四步裡沒有一步需要判斷，所以 plugin 也接了一個 `/tap`，讓那四步在房間裡一句話完成：
+
+| 訊息 | plugin 做的事 |
+|---|---|
+| `/tap <projname>` | 在 `projectsDir` 底下寫一個新的 `genesis/.tap`，並在對照表登記這個房間 |
+| `/tap <projname> <yyyy-mm-dd>` | 同上，並把起點寫進 `viewed:` |
+| `/tap` | 查對照表找出這個房間的專案 |
+| `/tap -uninstall` | 拆掉 route，並把對照表那一筆清掉 |
+| `/tap -install` | 手動上線，`autoInstall: false` 時才用得到 |
+
+前三條合流之後做同一件事：`cwd` 設成專案目錄，把 `tap.command` 叫起來，最後一個
+參數是 `tap.prompt`。跑完之後如果專案裡有 script，就順手把那個專案裝成 route
+（`autoInstall`，預設開著）——使用者要的是「改完就能測」，而上線這一步沒有任何判斷。
+
+**注意這是兩個不同的 `/tap`**：使用者在房間裡打的那個由本 plugin 攔截，
+harness 施展的那個是 2.8 的 Agent Skill。名字一樣是刻意的（使用者只需要記一個字），
+但它們是兩層。而**被叫起的 harness 不知道自己是被誰叫起的**——這是刻意的：
+從終端機叫它做的是一模一樣的事，多一個「你是被聊天室叫起的」只會多一條要維護的分支。
+
+幾個刻意的設計決定：
+
+- **一個房間屬於哪個專案，用一張表記，不靠掃描。** 曾經是掃 `.tap` 的：`.tap`
+  本來就是「這個專案在哪個房間上線」的記載，看起來不必再多一份設定。但同一個
+  房間先後開過兩個專案時，兩份 `.tap` 都還在，掃描就再也分不出要哪一個——而那
+  正是「重測一次」最常見的現場。所以改成一張表（`projectsFile`），**最後一次
+  指名的那個專案就是答案**。`.tap` 沒有因此變成裝飾品，它仍然是 skill 讀的那一份；
+  表只回答一個掃描答不了的問題。表裡沒有那一筆才退回掃描，掃到唯一一個就記進去。
+  表裡有、目錄卻不見了，就直接說不見了——把專案搬走或改名往往就是要讓它消失。
+
+- **route 當不了這個索引。** 它指的是**部署出去的那支 script**，而要打開的是
+  **原始碼專案**，這兩個位置常常不同（`D:\workspaces\...` 對 `D:\projects\...`）。
+
+- **不要求房間已經有 route。** 這一點跟 `/aside` 相反。`/tap <projname>` 的用途正是
+  替一個**還沒有 script 的房間**開專案；要求先有 route 等於要求先有 script，
+  那就永遠開不了第一個。所以 `/tap` 的開關是 `tap` 這段設定存不存在。
+
+- **不等它跑完。** 一輪檢討動輒好幾分鐘，而 hook 卡住的就是那一則訊息的回覆。
+  所以先回一句「開始了」，跑完再用 `openclaw message send` 補一則結果——就是
+  AUTHORING.md 第 9 節給 script 用的那條路。代價是 gateway 中途重開的話那則結果
+  就沒了；trace log 裡還看得到。
+
+- **同一個專案一次只跑一輪。** 兩個 harness 同時改同一份 script 只會互相蓋掉。
+
+- **要不要接續 session，看登記不看猜。** `continueCommand` 只在對照表說「這個
+  專案跑過了」時才用。猜錯的代價很具體：第一輪就叫 harness 去接一個不存在的
+  session，整輪直接失敗。接續失敗時把記號清掉，下一輪自動退回乾淨的 session。
+  plugin 不假設 harness 的 CLI 長什麼樣子——那句 `--continue` 是操作者寫在設定裡的。
+  接續也不是無限的：harness 把 `viewed` 往前推的那一輪就是終點。推書籤＝這一段結案、
+  context 已經落到 repo 裡，再帶著舊 session 走下去只是讓它愈來愈胖。
+
+- **上線是 plugin 做的，不是 harness 做的。** harness 只把 script 放到約定位置，
+  連一份設定檔都不寫；plugin 跑完才把「哪個房間、哪個專案」寫進設定，
+  而且先 `--dry-run` 驗過。這條界線讓「能改設定」這件事留在 plugin 手上——
+  AI 連提議的格式都碰不到，它能影響的只有「那個位置有沒有一支跑得起來的 script」。
+  跟裝好的完全一樣時就什麼都不做，回報也不會再喊一次。
+
+- **專案名要通過 `/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/`。** 它來自不受信任的聊天輸入，
+  而且會直接接在 `projectsDir` 後面當路徑用。開頭限定英數，所以不可能是 `.`、`..`
+  或 `-rf`，中間不允許任何路徑分隔字元。
+
+- **已經存在的 `.tap` 不覆寫。** 裡面的 `viewed:` 是上一輪檢討的進度，蓋掉等於叫
+  下一輪從頭看起。唯一的例外是使用者自己打了起點日期——那是他明講的。
+
+- **`allowFrom` 是給不完全掌握的房間用的。** 這一行會在這台機器上叫起一個能改檔案的
+  agent，而房間裡的每個人都打得出來。省略代表「房間裡的人都可以」，那只適合自己的房間。
+
 ---
 
 ## 3. 邊界：plugin 到哪裡為止
 
-plugin 是通用的路由器，職責只有四件事：選 route、吃掉 `ISSUE`、跑 script、
-依 exit code 決定短路還是放行。**領域邏輯與一切額外能力都在 script 那一側。**
+plugin 是通用的路由器，職責只有五件事：選 route、吃掉 `/aside`、接下 `/tap`、
+跑 script、依 exit code 決定短路還是放行。**領域邏輯與一切額外能力都在 script
+那一側；需要智力的判斷則在 `/tap` 叫起的 harness 那一側。**
 
 script 需要更多能力時，OpenClaw CLI 本身就是它的介面，plugin 不必轉手：
 
@@ -346,8 +432,10 @@ script 需要更多能力時，OpenClaw CLI 本身就是它的介面，plugin �
 這幾條都寫在 [AUTHORING.md](AUTHORING.md) 第 8、9 節，給 script 作者看。
 plugin 這一側不需要為它們新增任何欄位。
 
-真正屬於 plugin 的設定只有 route 的 `channel` + `target`：
-路由到「哪一支 script」是 plugin 的事，那支 script 之後做什麼都不是。
+真正屬於 plugin 的設定只有兩組，而且兩組都是路由問題：route 的
+`channel` + `target`（這個房間交給哪一支 script），以及 `tap` 的 `projectsDir`
++ `command`（這個房間對應哪個專案目錄、用哪個 harness 打開它）。
+路由到「哪裡」是 plugin 的事，到了那裡之後做什麼都不是。
 
 ### 為什麼 stdout 只收純文字
 
@@ -369,8 +457,13 @@ script 直接呼叫就好，而且順便拿到多則訊息與 edit——那些�
   事後要檢討那些輸入，用 `/tap`（2.8）從本機檔案還原。
 - **`handled: true` 但沒給 `reply`** → OpenClaw 回 `{ text: "NO_REPLY" }`，
   這是內建的靜默 token，使用者端什麼都不會收到。要「處理掉但不回話」就用這個。
-- **hot reload。** 改 `openclaw.json` 的 plugin config 會觸發 hot reload，
-  改 `src/index.js` 則要 `openclaw gateway restart`。
+- **plugin config 不會 hot reload。** 改 `openclaw.json` 之後要
+  `openclaw gateway restart` 才算數，改 `src/index.js` 當然也要。
+  這一條是實測出來的，而且付過代價：`/tap -install` 曾經把 route 寫進
+  `openclaw.json`，回話說「裝好了」，使用者下一句話卻還是走舊的 route——
+  設定檔在 17:01 就改好了，17:02 的訊息用的還是啟動時載入的那份。
+  **所以上線改成寫進 `projectsFile`**（每一則訊息都重讀，當場生效）；
+  plugin 自己也不可能去重啟 gateway——那等於在回話中途把自己殺掉。
 
 ---
 

@@ -70,13 +70,41 @@ stderr 只有在你非 0 離開時才會被人看到。
 | `20` | 我不會，請交給 AI | 這一輪照原本流程走，你什麼都沒發生過 |
 | 其他 | 出錯了 | 依 route 的 `onError`：`handle`（預設）把 stderr 當錯誤訊息回給使用者，`passthrough` 交給 AI |
 
-### 有一種訊息永遠不會到你手上
+### 你的 script 放哪裡
 
-`ISSUE` 開頭的訊息（大小寫不拘）由 plugin 直接吃掉：那是使用者在記
+放 `<專案>/scripts/intercept.mjs`（或 `.js`、`.cjs`、`.py`）就好。route 只要寫
+`{ "project": "<專案目錄名>", "channel": …, "target": … }`，**位置與直譯器都是每次
+派工時才推的**——設定檔裡不會有 `node.exe` 或 `uv.exe` 的絕對路徑，所以你換 node
+版本、重裝 uv，都不必回頭改設定。
+
+- `.mjs` / `.js` / `.cjs` → 用 gateway 自己那支 node 跑
+- `.py` → 找得到 `uv` 就 `uv run <script>`，找不到才退而用 `python`
+
+**Python 請寫成 self-contained**：既然是 `uv run` 跑的，依賴就用
+[PEP 723](https://peps.python.org/pep-0723/) 的 `# /// script` 區塊宣告在檔案開頭，
+不要假設環境裡裝了什麼。
+
+```python
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["httpx"]
+# ///
+```
+
+要放別的地方、或用完全不同的跑法，就在 route 寫 `command`（argv，絕對路徑）——
+那條路一直都在，只是你得自己負責那些路徑。
+
+### 有兩種訊息永遠不會到你手上
+
+`/aside` 開頭的訊息（大小寫不拘）由 plugin 直接吃掉：那是使用者在記
 「這個房間用起來哪裡不順」，不是給你的指令。
 
-所以**不要自己實作 `ISSUE`**，也不必在你的規則表裡幫它留位置——你根本收不到。
-使用者記下的那些，之後用 `/tap` 讀出來（見第 12 節）。
+`/tap`（含 `/tap <projname>`、`/tap <projname> <yyyy-mm-dd>`）也一樣被 plugin 接走：
+那是使用者要叫一個 AI harness 回頭檢討這個房間，見 README 的
+[從聊天室裡叫起來](../README.md#tap)。只有 `/tap` 這個字算，`/tapioca` 還是你的。
+
+所以**不要自己實作這兩個**，也不必在你的規則表裡幫它們留位置——你根本收不到。
+使用者記下的 `/aside`，之後用 `/tap` 讀出來（見第 12 節）。
 
 ---
 
@@ -459,7 +487,7 @@ npx skills add caridina-ai/openclaw-chat-interceptor
 
 - **放行給 AI 的輸入**，依相同輸入分群——這就是下一條規則要寫什麼的原料
 - **出錯的那幾輪**——使用者收到的是錯誤訊息而不是答案，優先修
-- **使用者打的 `ISSUE`**——他親口說的待辦，比任何推測都準
+- **使用者打的 `/aside`**——他親口說的待辦，比任何推測都準
 - 完整逐字稿，每一則底下標著它當時的下場
 
 前提是兩件事：route 的 `debug` 要開（沒開就只有逐字稿，不知道每一則的下場），

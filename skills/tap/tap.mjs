@@ -15,7 +15,7 @@
 //      → 內含 Conversation info(metadata，有 message_id) + Conversation context
 //        (前幾則，格式 "#id  時間 GMT+8 名字: 內容")
 //      → 唯一能拿到 message id 的來源，而且 context 裡連「AI 沒被叫醒也看得到的
-//        鄰近訊息」都有——被攔截、甚至 ISSUE 的訊息會從這裡漏出來
+//        鄰近訊息」都有——被攔截、甚至 /aside 的訊息會從這裡漏出來
 //   2. <sessionId>.jsonl（及輪替出去的 .reset./.deleted.）
 //      → 乾淨的 role:user 原文，但沒有 message id
 //   3. agent/codex-home/sessions/**/rollout-*.jsonl
@@ -26,8 +26,8 @@
 //   4. chat-interceptor.log（route 的 debug 開著才有）
 //      → 每一輪「收到什麼、對上哪條 route、最後是攔掉還是放行」。
 //        **「放行給 AI」那幾則就是下一條規則的原料**，這是檢討時最重要的一欄。
-//   5. chat-interceptor-issues.log
-//      → 使用者打的 `ISSUE ＿＿`。它不叫 AI 也不進 script，所以只有這裡有。
+//   5. chat-interceptor-asides.log
+//      → 使用者打的 `/aside ＿＿`。它不叫 AI 也不進 script，所以只有這裡有。
 //
 // 三份 session 來源都會有缺漏（session 輪替、context window 裁切），
 // 合併後才接近完整；輸出最後的「涵蓋範圍」會說還缺哪些 message id。
@@ -51,7 +51,7 @@ if (has("help") || has("h")) {
     [
       "usage: node tap.mjs [--tap <file>] [--channel <c> --target <id>] [--since <stamp>|0]",
       "                   [--format md|json] [--tail <n>] [--agent <id>]",
-      "                   [--log <file>] [--issues <file>]",
+      "                   [--log <file>] [--asides <file>]",
       "",
       "  --tap      維護現場檔，只有三個欄位：channel / target / viewed",
       "             （預設找 ./.tap、./genesis/.tap）",
@@ -101,7 +101,7 @@ if (!channel || !target) {
 const stateDir = process.env.OPENCLAW_STATE_DIR || join(homedir(), ".openclaw");
 const agentsDir = join(stateDir, "agents");
 const logPath = arg("log", join(stateDir, "logs", "chat-interceptor.log"));
-const issuePath = arg("issues", join(stateDir, "logs", "chat-interceptor-issues.log"));
+const issuePath = arg("asides", join(stateDir, "logs", "chat-interceptor-asides.log"));
 const onlyAgent = arg("agent");
 const format = arg("format", "md");
 const tail = Number(arg("tail", "400"));
@@ -342,7 +342,7 @@ let traceLogFound = false;
 }
 
 // ---------------------------------------------------------------------------
-// 5：ISSUE
+// 5：/aside
 // ---------------------------------------------------------------------------
 const issues = [];
 {
@@ -424,7 +424,7 @@ for (const turn of turns) {
   }
 }
 
-// ISSUE 同理，只是它可能出現在兩個地方：後來某一輪的 Conversation context 撈得到它，
+// /aside 同理，只是它可能出現在兩個地方：後來某一輪的 Conversation context 撈得到它，
 // trace log 也記過那一輪。**三個來源都要收斂成同一則**，否則檢討的人會以為
 // 使用者把同一件事講了三次。
 const orphanIssues = [];
@@ -535,7 +535,7 @@ if (format === "json") {
 
 const OUTCOME_LABEL = {
   handled: "攔下了，0 token",
-  issue: "ISSUE，記下來就好",
+  issue: "/aside，記下來就好",
   pass: "**放行給 AI**（script exit 20）",
   "pass-error": "script 出錯後放行給 AI",
   error: "**出錯**，使用者看到錯誤訊息",
@@ -565,12 +565,12 @@ if (summary.turns) {
       `沒有 route ${summary.noRoute}`,
   );
 }
-console.log(`ISSUE ${summary.issue} 則、逐字稿 ${timeline.length} 則`);
+console.log(`/aside ${summary.issue} 則、逐字稿 ${timeline.length} 則`);
 
-// ---- ISSUE：使用者親口說的待辦，優先於任何人的推測 ----
+// ---- /aside：使用者親口留下的話，優先於任何人的推測 ----
 if (shownIssues.length) {
   console.log("");
-  console.log(`## ISSUE（${shownIssues.length} 則）`);
+  console.log(`## /aside（${shownIssues.length} 則）`);
   console.log("");
   console.log("使用者自己記下的問題。**這比任何推測都準，先看這個。**");
   console.log("");
