@@ -1,176 +1,69 @@
 ---
 name: tap
-description: 汲取某個聊天室在 openclaw-chat-interceptor 底下的實際使用過程——使用者打過的每一句話（含被 script 攔掉、根本沒進 session 的那些）、每一句的下場（攔到／放行給 AI／出錯），以及使用者隨手打的 `/aside`——然後據此動手：已經有 script 的專案就把它改得更好用，還沒有 script 的新專案就把頻道裡聊出來的那個功能做出第一版。當使用者說「tap 一下我的某某頻道」「看看有哪些輸入沒被攔截到」「檢討一下上線之後的使用狀況」「使用者抱怨了什麼」「照我們在頻道裡討論的把這個東西做出來」時使用。
+description: 把 OpenClaw 聊天室裡聊出來的東西做成軟體。`/tap [yyyy-mm-dd HH:MM]` 汲取房間的對話（含被 script 攔掉、AI 沒看到的那些，以及 /aside），寫成 FIAT 文件；收到 go 照 FIAT 文件實作；`/tap -done` 驗收通過後 commit 並寫交接 memory。通常由 OpenClaw 的 /fiat 叫起。
+argument-hint: "[yyyy-mm-dd HH:MM] | -done"
 ---
 
 # tap
 
-[openclaw-chat-interceptor](https://github.com/caridina-ai/openclaw-chat-interceptor)
-會在 OpenClaw 呼叫模型之前，先把訊息交給該聊天室的 script。script 處理得了就直接回覆，
-**那一輪 0 token，也不會進 session 歷史**；處理不了才交還給 AI。
-
-省 token 的代價是：**被攔掉的輸入事後沒人看得到**。而檢討時最需要知道的偏偏就是
-「哪些話 script 還接不住」。這個 skill 把那些話撈回來。
-
-## 什麼時候用
-
-使用者說「tap 一下」「檢討一下這個頻道」「有哪些輸入沒被攔到」「我抱怨過什麼」時。
-目的**不是**產出一份報告——是**動手把那個房間變好用**。汲取只是手段。
-
-會遇到兩種現場，做法不一樣（見第四節）：
-
-| 現場 | 你要做的事 |
-|---|---|
-| 專案裡已經有 script | 照汲取到的使用狀況去改它 |
-| 專案幾乎是空的，只有 `genesis/.tap` | 這是**新專案**：房間裡聊出來的那個功能還沒有人做，第一版由你寫 |
-
-第二種很容易被誤判成「這個專案壞掉了」或「沒東西可以做」。不是——那是一個剛開好的
-現場，`.tap` 就是全部的交代：房間在這裡，去把大家在裡面聊的那件事做出來。
-
-## 一、先確認 `.tap`
-
-每個吃這個 plugin 的專案，用一個 `.tap` 記住自己的頻道在哪裡。放在 repo 根目錄或
-`genesis/` 底下都行，工具會自己找。**只有三個欄位**：
-
-```
-channel: telegram
-target:  -1001234567890
-viewed:  2026-08-18 20:43:20
-```
-
-| 欄位 | 說明 |
-|---|---|
-| `channel` | `telegram`、`discord`… |
-| `target` | 對話 id，寫法同 `openclaw message send --target`（裸 id、`channel:<id>`、`discord:channel:<id>` 都認得） |
-| `viewed` | 上一輪檢討看到哪裡為止。**留空或整行不寫＝看全部**。剛開好的新專案，這裡放的可能是一個起點日期——房間往往是先亂聊了很久，聊到某個點子不錯才決定開專案，那之前的話跟這個專案無關 |
-
-沒有 `.tap` 就先建一個。使用者不知道 target 是什麼的話，從攔截器的 log 撈：
-`~/.openclaw/logs/chat-interceptor.log` 每一行 `turn` 都帶著 `channel` 與 `target`。
-
-> **`.tap` 絕不進版控。** 頻道位置是敏感資訊——有心的人跑來那個頻道，
-> 就能利用機器人的漏洞騙東西。建好之後確認 `.gitignore` 有擋著。
-
-## 二、跑
-
-`tap.mjs` 就在這份 SKILL.md 旁邊（Node 18+，不必安裝任何套件）：
+三種叫法，各是一段工作。每一段的最後一步都是呼叫回報程式，然後停下來：
 
 ```bash
-node <這個 skill 的目錄>/tap.mjs --tap genesis/.tap
+node "$FIAT_REPORT" <fiat|built|done> "<給主述者的一段話>"
 ```
 
-在專案根目錄執行時，`--tap` 可以省略（自己找 `./.tap`、`./genesis/.tap`）。
+沒有 `$FIAT_REPORT` 這個環境變數，就不必呼叫。
 
-| 參數 | 說明 |
-|---|---|
-| `--tap <file>` | 維護現場檔 |
-| `--channel` / `--target` | 不用 `.tap`，直接指定房間 |
-| `--since <stamp>` | 這一次要從哪裡看起，蓋過 `viewed`；`--since 0` 看全部 |
-| `--tail <n>` | 逐字稿只列最後 n 則（預設 400，`0` 表示全部） |
-| `--format json` | 給程式吃的版本 |
-| `--sermo <file>` | 把原話一字不改寫成誕生紀錄（見第四節），不輸出報告 |
-| `--exclude <name>` | 搭配 `--sermo`，排除某個發話者，可重複 |
-| `--log <file>` | 攔截器 trace log，預設 `~/.openclaw/logs/chat-interceptor.log` |
-| `--asides <file>` | `/aside` 的紀錄檔，預設 `~/.openclaw/logs/chat-interceptor-asides.log` |
+主述者可能會在這個 session 裡跟妳討論。談定的修改要寫回 FIAT 文件——下一輪汲取看不到這裡的對話。
 
-第一次 tap 一個老頻道時輸出會很長。先跑一次看摘要，再用 `--since` 分段讀。
+## `/tap [yyyy-mm-dd HH:MM]`
 
-## 三、報告怎麼讀
+1. **新專案還是舊專案**：專案目錄裡除了 `genesis/` 之外沒有程式，就是新專案；已經有程式，就是維護舊專案。
 
-由上而下就是優先順序：
+2. **汲取**：
 
-1. **`/aside`** —— 使用者在使用當下自己打的 `/aside ＿＿`。plugin 直接吃掉：不叫 AI、
-   不給 script、不回話，所以它只存在於 issue log 裡。**這是使用者親口說的待辦，
-   比你我的任何推測都準，先看這個。**
-2. **放行給 AI 的輸入** —— script 說「我不會」（exit 20）的那些，依相同輸入分群。
-   **同一句話講愈多次，就愈值得寫成規則**：那是下一條規則最直接的原料。
-3. **出錯** —— 使用者收到的是錯誤訊息而不是答案。優先修。
-4. **逐字稿** —— 全部合併還原的對話，每一則底下標著它當時的下場。
-   要看使用者「講了什麼之後又補一句」「機器人回錯了他怎麼反應」就讀這裡。
-5. **涵蓋範圍** —— 這份汲取完不完整。`missingIds` 有東西代表有幾則真的撈不回來
-   （session 輪替或 context 裁切吃掉了）；`interceptLog: null` 代表 route 沒開
-   `debug`，所以**不知道每一則的下場**，只有逐字稿。
+   ```bash
+   node <這份 SKILL.md 所在的目錄>/tap.mjs [--since "yyyy-mm-dd HH:MM"]
+   ```
 
-## 四、然後動手
+   - 房間讀 `genesis/.tap`（`channel` / `target` / `timestamp`）。`timestamp` 是上一輪結束的時間，汲取從那裡開始；空的就是從頭。
+   - `/tap` 後面帶了時間，就用 `--since` 把起點改成那個時間。
+   - 輸出依序是：`/aside`（使用者特地留下的話，整段列出）；逐字稿，每一則是 `時間　#id 發話者：內容`，AI 沒看到的那些底下有一行 `↳` 說明下場（script 接走、script 出錯、/aside）；最後是涵蓋範圍（缺了哪些 message id）。太長就用 `--since` 分段讀。
 
-這才是重點。分兩種現場。
+3. **判斷這次要做的範圍**，濃縮成一行描述，當 FIAT 文件的標題（`# ` 那一行）。
 
-### 已經有 script：改它
+4. **寫 FIAT 文件**：
+   - 新專案：`genesis/FIATLUX.md`。
+   - 舊專案：`genesis/FIAT-{slug}.md`（slug 用英文小寫加連字號，不要跟既有的撞名），並更新 `genesis/README.md`。
+   - `genesis/README.md` 依順序列出每份 FIAT 文件的標題，各自連到那份文件，`FIATLUX.md` 排第一。只有 `FIATLUX.md` 時不建。
 
-- 高頻又格式固定的「放行」輸入 → 在那支 script 裡加規則吃下來，變成 0 token。
-- 使用者抱怨的 → 照他說的改。他講的是他實際遇到的事，不要替他重新詮釋。
-- 出錯的 → 先修。
-- 分不清是「該寫新規則」還是「刻意放手」時，回頭看逐字稿裡那句話的上下文。
+   寫法：
+   - 用主述者的口吻：「我想要……」「請妳幫我……」。
+   - 只寫 WHAT，不寫 HOW。主述者明確指定的技術才寫進去。
+   - 以主述者的意志為準。其他人或其他 AI 的搭腔與建議，主述者沒有採納的都不算。
 
-### 還沒有 script：把第一版寫出來
+5. `node "$FIAT_REPORT" fiat "<FIAT 檔名：標題>"`，然後停下來。
 
-只有 `genesis/.tap` 的專案，代表這個房間剛決定要做一件事，而那件事還沒有人寫。
-**逐字稿就是需求書**：
+## 收到 `go`
 
-1. **先認出那件事是什麼。** 使用者反覆講、講得最具體、講完還一直補細節的那一串，
-   就是他要的功能。`/aside` 與被放行的輸入同樣是原料——那是他已經想按、卻沒有東西接的鍵。
-2. **劃出 script 與 AI 的界線。** 格式固定、高頻、不需要語意判斷的輸入交給 script；
-   其餘照舊交給 AI。這條界線就是這個 plugin 存在的理由，不要把全部都塞進 script。
-3. **寫出第一版**：script 本身、它自己的測試，以及一份講清楚「這個房間在做什麼」的專案文件。
-   **那份文件就是這個專案撐得久的紀錄**——逐字稿會過期（session 輪替、context 裁切、
-   `viewed` 一推就撈不回來），文件不會。需求是什麼、你做了哪些取捨、哪些還沒解決，
-   寫在那裡。
+照這一輪的 FIAT 文件實作。
 
-   > 不必另外產一份逐字稿存檔。使用者要留原話的話他自己會留——那是他的方法論，
-   > 不是你的工作。而且原話裡有住處、家人朋友、行程，多存一份就多一個外洩的機會。
-4. **script 就放 `scripts/intercept.mjs`（或 `.js`、`.cjs`、`.py`）。** 那就是全部的
-   約定——**沒有設定檔要寫**。plugin 靠這個名字找到它，靠副檔名決定怎麼跑它，
-   而直譯器是上線那一刻才解析的：`.mjs`/`.js`/`.cjs` 用 gateway 自己那支 node，
-   `.py` 用 `uv run`。
+- HOW 全權由妳決定，放手用最強的技術。對話裡 AI 提過的做法、主述者問起的做法，都不必理會。
+- 做完先不要 commit。
+- 成果是一個 OpenClaw skill，放在專案裡的 `<skill 名>/`（新專案就用專案名）。`/fiat -install` 會把它裝進這個房間的 agent，不必寫設定檔，也不要動 gateway 的設定。
+  - `SKILL.md`：教 AI 處理 script 放行的那些輸入。
+  - `scripts/intercept.{mjs,js,cjs,py}`：攔截 script。stdin 收 JSON `{ body, channel, target, senderId, sessionKey, agentId }`；stdout 是回給使用者的純文字，空的就是不回話；exit `0` 處理掉、exit `20` 交給 AI、其他是出錯。
+  - 有副作用的動作一旦做了，就不可以 exit `20`：AI 會拿同一句話再做一次。
+  - `.py` 是用 `uv run` 跑的，依賴寫在開頭的 PEP 723 `# /// script` 區塊。
+  - 細節見 [AUTHORING.md](https://github.com/caridina-ai/openclaw-chat-interceptor/blob/main/docs/AUTHORING.md)。
+- 想好驗收測試怎麼做，確認專案的 `README.md` 寫清楚了。
+- `node "$FIAT_REPORT" built "<做了什麼、怎麼驗收>"`，然後停下來。
 
-   **`.py` 一定要寫成 self-contained**：既然是 `uv run` 跑的，依賴就用
-   [PEP 723](https://peps.python.org/pep-0723/) 的 `# /// script` 區塊宣告在開頭，
-   不要假設環境裡裝了什麼。
+## `/tap -done`
 
-   **你自己不要去改任何 gateway 設定，也不要為它寫設定檔。** 把 script 放到那個
-   位置就夠了：這一輪結束之後它會自己上線，使用者馬上就能拿去測。
-   所以**確定值得跑了才把它放上去**。
+驗收通過了。
 
-第一版寧可小而準：先吃下最常出現的那一兩種輸入，其餘全部放行。下一輪 `/tap`
-就會帶著真實的使用紀錄回來，那時候再擴。
-
-### 兩種現場都適用
-
-**動手前先讀那支 script 所屬專案的文件**，以及 plugin 的
-[`docs/AUTHORING.md`](https://github.com/caridina-ai/openclaw-chat-interceptor/blob/main/docs/AUTHORING.md)——
-新專案更要讀，因為 script 協定（stdin 收 JSON、stdout 出純文字、exit `0`／`20`）全在那裡。
-其中一條鐵則值得在這裡重複：
-
-> **有副作用的動作，一旦做了就絕對不可以 exit 20。**
-> AI 會拿到同一句話再做一次——重複入帳、重複發通知。先判斷，再動手。
-
-寫完要跑那個專案自己的測試，並且記得 script 是部署過去的那一份才算數
-（很多專案 repo 與部署位置是兩個地方）。
-
-## 五、收尾：`viewed` 什麼時候才可以推
-
-報告最後一行會給你一個新的 `viewed:`。**那是一個提議，不是一個指示。**
-
-`viewed` 是**接力棒，不是紀念碑**：推了，下一輪 tap 就只剩那個時間點之後的東西。
-所以推它的條件不是「我寫完程式了」，而是下面兩件**都**成立：
-
-1. **你沒有在等答案。** 這一輪如果是 `BLOCKED`——你提了問題、要使用者回話——
-   就不要推。推了，下一輪連自己問過什麼都撈不回來。
-2. **來龍去脈已經寫進 repo。** 需求是什麼、你做了哪些取捨、哪些還沒解決，
-   都在專案文件裡。**這一條才是真正的保險**：逐字稿會被 `viewed` 切掉，repo 不會；
-   只要 repo 講得清楚，下一輪就算只看到一句新回饋也接得上。
-
-兩件有一件不成立就別推，讓下一輪重看一次全部。多讀一點永遠比看不懂便宜。
-
-```
-viewed: 2026-08-18 20:43:20
-```
-
-## 疑難排解
-
-| 症狀 | 原因 |
-|---|---|
-| 有逐字稿，但每一則都沒有「下場」 | route 沒開 `debug`。在 plugin 設定加 `"debug": true`，之後才會有 trace log |
-| 一則都汲取不到 | `channel`／`target` 打錯，或 OpenClaw 的狀態目錄不在預設位置（設 `OPENCLAW_STATE_DIR`） |
-| `/aside` 是空的，但使用者說他打過 | 舊版寫的是另一個檔（`chat-interceptor-issues.log`），用 `--asides <那個檔>` 指過去 |
-| 逐字稿比實際短很多 | 正常。session 輪替與 context 裁切會吃掉一部分，看「涵蓋範圍」的 `missingIds` |
-| 專案裡除了 `.tap` 什麼都沒有 | 那不是壞掉，是新專案。逐字稿就是需求書，第一版由你寫，見第四節 |
+1. 檢查要 commit 的內容有沒有個人資訊（chat id、姓名、住處、帳號……），有就先處理掉。`.tap` 不進版控。
+2. commit。
+3. 把這一輪的經驗寫進交接 memory——這個 session 等一下就會結束。
+4. `node "$FIAT_REPORT" done "<commit 了什麼>"`。

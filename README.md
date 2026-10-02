@@ -1,14 +1,15 @@
 # openclaw-chat-interceptor
 
-一個 OpenClaw plugin：在 `before_agent_reply` hook 攔下聊天訊息，先交給該對話
+一個 OpenClaw plugin：在 `before_dispatch` hook 攔下聊天訊息，先交給該對話
 對應的 script 處理。script 處理得了就直接回覆，**整輪不呼叫模型，0 token**；
 script 說「我不會」時，訊息原封不動交還給 AI 走原本的流程。
 
 適合固定格式、高頻出現、不需要語意判斷的指令——那些交給模型只是浪費 token。
 
-另外兩件事也一併在這裡解決：使用者可以隨手打一則 [`/aside`](#aside) 記下哪裡不順手，
-而 [`/tap`](#tap) 把整段使用過程汲取出來交給 AI 檢討——**包含那些被攔掉、
-從來沒進過 session 的輸入**。
+同一個 plugin 也管那些 script 是怎麼生出來的：在房間裡聊出一個點子，打一句
+[`/fiat`](#fiat)，Claude Code 就會把整段對話汲取出來——**包含那些被攔掉、從來沒進過
+session 的輸入**，以及使用者隨手打的 [`/aside`](#aside)——寫成需求文件、實作、
+裝進房間讓你驗收。
 
 - **要寫 script 的人看這份**：[docs/AUTHORING.md](docs/AUTHORING.md)
 - 內部設計（hook 機制、plugin 實作）：[docs/DESIGN.md](docs/DESIGN.md)
@@ -23,8 +24,8 @@ git clone https://github.com/caridina-ai/openclaw-chat-interceptor
 openclaw plugins install --link <path to this repo>
 ```
 
-然後在 `~/.openclaw/openclaw.json` 設定。`allowConversationAccess` 是必要的：
-非 bundled 的 plugin 沒有它就不能註冊 `before_agent_reply`。
+然後在 `~/.openclaw/openclaw.json` 設定。`allowConversationAccess` 要留著：它讓 gateway
+啟動時就載入這個 plugin，hook 只在那時註冊。OpenClaw 要有 `before_dispatch` 這個 hook（2026.9.6 實測過）。
 
 ```json
 {
@@ -34,7 +35,6 @@ openclaw plugins install --link <path to this repo>
         "enabled": true,
         "hooks": { "allowConversationAccess": true },
         "config": {
-          "debug": true,
           "routes": [
             {
               "name": "my-skill",
@@ -68,7 +68,7 @@ openclaw plugins install --link <path to this repo>
 
 > **改 `openclaw.json` 之後要 `openclaw gateway restart`。**
 > plugin config **不會** hot reload——實測過：設定檔改好之後，下一則訊息還是走舊的
-> route。這也是為什麼 [`/tap -install`](#tap) 不把 route 寫進設定檔（見那一節）。
+> route。這也是為什麼 [`/fiat -install`](#fiat) 不把 route 寫進設定檔。
 
 > **前提**：Telegram 的 `groupPolicy` 預設是 `allowlist`。群組沒列在
 > `channels.telegram.groups` 裡，訊息在 channel ingress 就被丟掉了，根本輪不到
@@ -81,8 +81,8 @@ openclaw plugins install --link <path to this repo>
 |---|---|
 | `debug` | 每一輪的判斷過程寫進 `logFile` |
 | `logFile` | 預設 `~/.openclaw/logs/chat-interceptor.log` |
-| `asideLogFile` | `/aside` 訊息寫到哪，預設 `~/.openclaw/logs/chat-interceptor-asides.log` |
-| `tap` | 開啟房間裡的 [`/tap`](#tap) 指令。省略這一段，`/tap` 就跟一般訊息一樣交給 script 與 AI |
+| `offstageLogFile` | AI 沒看到的每一句話寫到哪（見 [offstage log](#offstage)），預設 `~/.openclaw/logs/chat-interceptor-offstage.log` |
+| `fiat` | 開啟 [`/fiat`](#fiat)。省略這一段，`/fiat` 只會回一句「還沒設定」 |
 | `routes[]` | 依序比對，第一個對上的勝出；都沒對上就整輪交給 AI |
 
 每個 route：
@@ -90,7 +90,7 @@ openclaw plugins install --link <path to this repo>
 | 欄位 | 必要 | 說明 |
 |---|---|---|
 | `target` | ✓ | 對話 id，寫法同 `openclaw message send --target` |
-| `project` | ✓＊ | `projectsDir` 底下的目錄名。要跑什麼**每次派工時才推**（見下） |
+| `project` | ✓＊ | `fiat.projectsDir` 底下的目錄名。要跑什麼**每次派工時才推**（見下） |
 | `command` | ✓＊ | script 的 argv，約定不合用時的逃生口。給了就贏過 `project`。**用絕對路徑** |
 | `name` | | trace 與錯誤訊息裡的標籤；用 `project` 的話不必給 |
 | `channel` | | `telegram`、`discord`…；省略代表不限 channel |
@@ -146,6 +146,26 @@ discord    123456789012345678  ≡  channel:123456789012345678
 完整的作者指南、可直接抄的範本、以及改寫既有 skill 的步驟，
 見 [docs/AUTHORING.md](docs/AUTHORING.md)。
 
+## AI 沒看到的那些：offstage log
+
+<a id="offstage"></a>
+
+被 script 接走的那一輪**不進 session**——這是 0 token 的必然代價。事後要還原整段對話，
+AI 看到的那些翻 session 檔就有，AI 沒看到的那些就得另外記。
+
+所以 plugin 把**每一句 AI 沒看到的話**都記進 `offstageLogFile`，一行一筆
+`<當地時間> <JSON>`：
+
+| `kind` | 什麼時候 | 記下什麼 |
+|---|---|---|
+| `script` | script 接走了（exit 0） | 原文、script 回了什麼 |
+| `error` | script 出錯，使用者看到錯誤訊息 | 原文、那則錯誤訊息 |
+| `aside` | 使用者打了 [`/aside`](#aside) | 原文 |
+
+放行給 AI 的那些不記——session 裡本來就有。這個檔**一直開著**，不看 `debug`：
+`debug` 管的是 plugin 的除錯 trace，這個檔是對話紀錄，不該因為某人沒開除錯就少一塊。
+[`/tap`](#tap) 讀的就是它。
+
 ## `/aside`
 
 <a id="aside"></a>
@@ -156,170 +176,102 @@ discord    123456789012345678  ≡  channel:123456789012345678
 /aside 按鍵盤之後要等好幾秒才有反應
 ```
 
-plugin 自己吃掉：**不呼叫 AI、不傳給 script、不回話**。多行也可以，大小寫不拘。
+這是 plugin 註冊給 OpenClaw 的 slash command：**不呼叫 AI、不傳給 script、不回話**，
+只記進 [offstage log](#offstage)。多行也可以。房間裡的每個人都能用，每個房間的行為都一樣。
 
 名字取自戲劇的「旁白」——說出口、留在劇本裡，但台上其他角色聽不見。這裡也一樣：
-它留在房間的紀錄裡（下面的 `/tap` 撈得回來），但 AI 與 script 都收不到。
-
-**每個房間的行為都一樣**：有沒有 route、有沒有專案、`debug` 開不開，都不影響。
-使用者要的是「我在這裡留一句，誰都不要理」——這件事如果在某些房間會突然叫醒 AI，
-那他每次開口前都得先想「這間算不算」，那就不是一個他敢用的東西了。
-
-只認 `/aside` 這個開頭，後面接什麼就原樣記什麼（`/asidebar` 這種不算）。
-Telegram 群組裡的 `/aside@botname` 也認。
+它留在房間的紀錄裡（[`/tap`](#tap) 撈得回來），但 AI 與 script 都收不到。
 
 光靠 AI 答應「看到這種訊息就靜默略過」是不算數的：那句話還是進了 session、
 還是叫醒了模型、還是花了 token。真正做得到的只有在模型之前就吃掉，也就是這裡。
+萬一寫不進去，那一則會回一句 `aside not recorded: …`，不會默默把使用者的話弄丟。
 
-被吃掉的訊息不進 session，所以它會被寫進 `asideLogFile`，一行一筆 JSON——
-下面的 `/tap` 讀的就是這個檔。萬一寫不進去，那一則會回一句
-`aside not recorded: …`，不會默默把使用者的話弄丟。
+## `/fiat`
 
-## `/tap`
+<a id="fiat"></a>
 
-<a id="tap"></a>
+在房間裡聊著聊著，軟體就生出來了。`/fiat` 是 plugin 註冊給 OpenClaw 的 slash command，
+它用 [ccrun](https://github.com/neritina-ai/cli-ccrun) 在專案目錄叫起一個 Claude Code——
+開著 Remote Control，所以你可以從手機接上去跟它討論——再請它施展 [`/tap`](#tap) 技能。
 
-上線之後真正的問題是「哪裡還可以改」。但被攔掉的輸入不進 session，
-OpenClaw 的 CLI 也沒有讀取頻道歷史的指令。`/tap` 是一個
-[Agent Skill](https://github.com/vercel-labs/skills)，把整段使用過程還原出來
-交給 Claude Code 這類 AI harness 檢討：
+一般的一輪：
 
-```bash
-npx skills add caridina-ai/openclaw-chat-interceptor
-```
+1. `/fiat myproj` 開新專案，或 `/fiat` 維護這個房間的專案。
+2. Claude Code 汲取房間的對話，寫出一份需求文件：新專案是 `genesis/FIATLUX.md`，
+   維護舊專案是 `genesis/FIAT-{slug}.md`。寫好了回報到房間。
+3. 你讀過（有問題就用 Remote Control 跟它談），在 Remote Control 打 `go`，或在房間打 `/fiat -go`，它開始實作。
+4. 實作完它回報，**同時自動裝進這個房間**，你直接在房間裡驗收。
+5. 驗收過了打 `/fiat -done`：它 commit、寫下交接 memory、回報，
+   然後 `.tap` 的 `timestamp` 推到當下，Claude Code 關閉。
 
-（只裝這一個 skill：`npx skills add caridina-ai/openclaw-chat-interceptor --skill tap`；
-裝給特定 harness 加 `-a claude-code`，裝成全域加 `-g`。）
-
-裝好之後在專案裡叫它：**「tap 一下我的記帳頻道，看看哪裡可以改」**。它會給你
-
-- 使用者實際打過的每一句話，**包含被 script 攔掉、沒進 session 的那些**
-- 每一句當時的下場：攔下了、放行給 AI、還是出錯了
-  ——**「放行給 AI」那幾則就是下一條規則的原料**
-- 使用者累積的 `/aside`
-
-然後 AI 拿這些去動手：已經有 script 的就改它，還沒有 script 的新專案就把房間裡
-聊出來的那個功能做出第一版。汲取只是手段，寫程式才是目的。
-
-每個專案用一個 `.tap` 記住自己的頻道在哪裡，**只有三個欄位**：
-
-```
-channel: telegram
-target:  -1001234567890
-viewed:  2026-08-18 20:43:20
-```
-
-`viewed` 是上一輪檢討看到哪裡為止，留空就是看全部；**成果上線之後**才推到當下，
-下次只看新的（還沒上線就推，下一輪會看到抱怨卻看不到需求）。
-**`.tap` 絕不進版控**——頻道位置是敏感資訊。
-
-要讓每一則都帶著「下場」，plugin 設定裡的 `debug` 要是 `true`；
-沒開也還是有逐字稿，只是不知道哪些被攔到了。
-
-### 從聊天室裡叫起來
-
-上面那段講的是「人走到終端機、切到專案目錄、叫起 harness」。那三步都是機械動作，
-所以也可以直接在房間裡打：
+連續版是第一步多加一個 `-go`（`/fiat myproj -go` 或 `/fiat -go`）：
+它寫完需求文件不停，直接做到第 4 步等你驗收。忘了加也沒關係，停在需求文件時補一句
+`/fiat -go` 就會接著做——`-go` 永遠是「接下來一路自動做到裝好」。
 
 | 打這個 | 會發生什麼 |
 |---|---|
-| `/tap <projname>` | 在 `projectsDir` 底下開一個新專案（寫好 `genesis/.tap`），再叫起 harness |
-| `/tap <projname> <yyyy-mm-dd>` | 同上，但汲取只從那一天開始 |
-| `/tap` | 回到這個房間的專案，再叫一次 harness——「來看我剛剛講的意見」 |
-| `/tap -uninstall` | 拆掉 route，並讓這個房間不再屬於任何專案 |
-| `/tap -install` | 例外用的手動上線（見下） |
+| `/fiat <projname>` | `projectsDir` 底下還沒有這個目錄：開新專案（寫好 `genesis/.tap`），綁定這個房間，叫起 Claude Code |
+| `/fiat` | 叫起 Claude Code 維護這個房間綁定的專案 |
+| `/fiat ?` | 只查不做：這個房間綁了哪個專案、裝了什麼、Claude Code 開著沒有、`timestamp`，以及 openclaw.json 裡手寫的 route。全形的 `？` 也行 |
+| `… -t yyyy-mm-dd HH:MM` | 這一輪從那個時間開始汲取。房間常常先亂聊很久，聊到某個點子不錯才決定開專案 |
+| `… -go` | 一路自動做到裝好。Claude Code 已經開著（例如停在需求文件），就是請它接著實作 |
+| `/fiat -install [projname]` | 把專案的 skill 裝進 OpenClaw，在這個房間上線，當場生效 |
+| `/fiat -uninstall` | 下線、把裝上去的 skill 拿掉，解除這個房間與專案的綁定 |
+| `/fiat -done` | 驗收過了，請 Claude Code 收尾 |
 
-第二種是為了「先亂聊很久，聊到某個點子不錯才決定開專案」的房間：起點日期會寫進
-新 `.tap` 的 `viewed:`，那之前的話就不會被撈回來。
+**一個專案就是一個 OpenClaw skill**：`SKILL.md` 教 AI 處理 script 放行的那些輸入，
+`scripts/intercept.*` 攔下確定性的那些（見 [AUTHORING.md](docs/AUTHORING.md) 第 6 節）。
+skill 放在專案根目錄，或專案底下唯一一個有 `SKILL.md` 的資料夾（`<專案>/<skill>/`）。
 
-前三種會叫起 harness：plugin 立刻回一句「開始了」，harness 在背景跑，跑完再回報
-一則結果——一輪檢討動輒好幾分鐘，不能讓房間卡在那裡沒反應。同一個專案一次只跑一輪。
-`-uninstall` 只改設定，所以是當場回話。
+**安裝**就是 `openclaw skills install <skill> --force --agent <這個房間的 agent>`：
+skill 被**複製**進那個 agent 的 workspace，那一份就是上線版——AI 讀的是它的 `SKILL.md`，
+route 跑的是它的 script。開發目錄之後怎麼改都不影響線上，直到再 `-install` 一次。
+沒被攔下的輸入怎麼交到這個 skill 手上是 OpenClaw 的事，不必在房間的 systemPrompt 裡指定。
 
-### 上線是自動的
+幾條規矩：
 
-**harness 跑完就會上線**，所以你改完馬上就能測。日常那條路上根本不需要「上線」
-這個指令——需要動手的只有 `-uninstall`，而那是「這個房間要改作別的用途」時才有的事。
+- **一個房間一個專案。** 房間已經綁了 A，`/fiat B` 是錯誤——要換就 `/fiat -uninstall`
+  再 `/fiat -install B`。`/fiat A` 等於 `/fiat`。
+- **一個房間一次一個 Claude Code。** 開著的時候再打 `/fiat` 會被擋下來。
+- **起點一定要帶 `-t`**，不然 `/fiat 2026-09-28` 分不出是起點還是專案名。忘了帶的時候，
+  回話會直接給出補好的那一句。
+- `-t` 只影響這一輪，不會寫進 `.tap`。`.tap` 的 `timestamp` 只在 `-done` 那一刻往前推。
+- `-install` 裝之前會先確認 skill 在、script 在、直譯器找得到。已經裝過也照裝——那就是把新版推上線。
 
-**harness 自己不裝任何東西，也不為它寫任何設定檔。** 它只是把 script 放到約定的位置：
+### 回報程式
 
-```
-<projectsDir>/<專案>/scripts/intercept.mjs
-```
+Claude Code 每一段結束（需求文件寫好、實作完成、commit 完）都會呼叫 plugin 附的
+回報程式 `src/report.mjs`。它把 Claude Code 寫的那段話送回房間，並且做完那一段該做的
+機械動作：
 
-裝的是 plugin，而它記下來的只有「這個房間現在算 ledger 的，而且正在跑」。
+| 那一段 | 回報程式還做什麼 |
+|---|---|
+| 需求文件寫好 | 連續版的話，替它排好下一步「實作」 |
+| 實作完成 | 把 skill 裝進 OpenClaw、在這個房間上線，等同 `/fiat -install` |
+| commit 完 | 更新 `.tap` 的 `timestamp`，標記「可以關了」——gateway 接著從外面把 Claude Code 關掉 |
 
-**而且它不寫進 `openclaw.json`。** 那份設定不會 hot reload——寫進去要重啟 gateway
-才算數，但使用者按完的下一秒就會去試，於是會看到「裝好了」卻沒有反應。
-所以上線只是在 `projectsFile` 那一筆加一個旗標，而那個檔**每一則訊息都會重讀**，
-當場生效。順帶一個好處：**一則聊天訊息再也碰不到 gateway 的設定。**
+Claude Code 不知道這些，它只知道「每段結束要回報」——這些動作沒有一個需要判斷，
+放在一支每段都必經的程式裡，就不會有哪一次忘了做。
 
-兩種情況會被擋下來，而且會在回報裡說明原因：**專案裡還沒有 script**（那就當它還不是
-一條 route，什麼都不做）、**副檔名對應的直譯器找不到**（例如 `.py` 但這台機器上沒有
-`uv` 也沒有 `python`）。harness 那一輪失敗的話也不裝——失敗那一輪的產物本來就不該相信。
+### 上線不寫進 `openclaw.json`
 
-已經裝著一模一樣的東西時就什麼都不做，回報裡也不會再喊一次。第二輪之後多半都是
-這樣：改的是 script 的內容，route 指的還是同一個專案。
+那份設定不會 hot reload——寫進去要重啟 gateway 才算數，但使用者按完的下一秒就會去試，
+於是會看到「裝好了」卻沒有反應。所以 route 只是在 `projectsFile` 那一筆記下「裝上去的
+那一份在哪」，而那個檔**每一則訊息都會重讀**，當場生效；skill 那一側由 OpenClaw 的
+skills watcher 在下一輪接手。順帶一個好處：**一則聊天訊息再也碰不到 gateway 的設定。**
+`openclaw.json` 裡人手寫的 route 永遠優先。
 
-`tap.autoInstall` 設成 `false` 就關掉這個行為，改成自己打 `/tap -install`——
-想在上線前先看一眼的時候用得上。
+### 設定
 
-### harness 記不記得上一輪
-
-預設**不記得**：每一次 `/tap` 都是一個全新的行程，context 空的。它靠兩個地方
-重建理解——repo（需求、取捨、還沒解決的問題）與 `viewed` 之後的房間逐字稿。
-這是刻意的：狀態放在你看得見、也改得動的地方。
-
-但它問了你問題、你回答之後，「它記不記得自己問過什麼」就有差了。設 `continueCommand`
-就會接續同一個 session：
-
-```json
-"continueCommand": [
-  "C:/Users/you/.local/bin/claude.exe", "-p", "--continue",
-  "--permission-mode", "bypassPermissions"
-]
-```
-
-`--continue` 接的是**當前目錄**最近那個對話，而 harness 永遠站在專案目錄——
-目錄本身就是 session key，不必存 session id。
-
-第一輪一定用 `command`（那時候還沒有 session 可以接，硬接會整輪失敗）。
-「這個專案跑過了沒」不用猜，記在對照表裡；接續失敗（session 過期、被刪掉）就把
-記號拿掉，下一輪從乾淨的開始，並在回報裡說一句——不然每一輪都會撞同一面牆。
-
-**而且它不會無限接續下去。** harness 把 `viewed` 往前推的那一輪，session 就到此為止：
-推書籤代表這一段結案了、來龍去脈已經寫進 repo、逐字稿也翻頁了，那正是丟掉累積
-context 最誠實的分界線。下一輪 `/tap` 從乾淨的開始，回報裡會說一句。
-
-**接續是加速器，不是真相來源。** repo 該寫的還是要寫：session 會過期，repo 不會。
-
-### 哪個專案對應哪個房間
-
-一個房間一筆，記在 `projectsFile`（預設 `~/.openclaw/chat-interceptor-projects.json`）。
-`/tap <projname>` 寫它，`/tap` 讀它，`/tap -uninstall` 清掉它。
-
-為什麼不是直接掃 `.tap`：同一個房間先後開過兩個專案時，兩份 `.tap` 都還在，掃描
-就再也分不出你要哪一個——而那正是「重測一次」最常見的現場。表沒有這個問題，
-**最後一次指名的那個專案就是答案**，舊專案的檔案原地不動也不會來搗亂。
-
-`.tap` 不會因此變成裝飾品：它仍然是「這個專案在哪個房間上線」的記載，也仍然是
-skill 讀的那一份。表只回答一個掃描答不了的問題——同一個房間現在算哪一個專案的。
-
-表裡沒有那一筆時（例如手工建的專案）會退回掃描，掃到唯一一個就順手記進表。
-反過來，表裡有、但目錄已經不見了，就直接說「你記的那個專案不見了」——把專案搬走
-或改名往往就是要讓它消失，那就照做，不要自作聰明重新掃一個出來頂替。
-
-要開這個功能，設定裡加一段 `tap`：
+要開這個功能，設定裡加一段 `fiat`：
 
 ```json
-"tap": {
+"fiat": {
   "projectsDir": "D:/projects",
-  "command": ["C:/Users/you/.local/bin/claude.exe", "-p", "--permission-mode", "bypassPermissions"],
-  "notifyCommand": [
+  "ccrun": ["C:/Users/you/go/bin/ccrun.exe"],
+  "openclaw": [
     "C:/Program Files/nodejs/node.exe",
-    "C:/Users/you/AppData/Roaming/npm/node_modules/openclaw/openclaw.mjs",
-    "message",
-    "send"
+    "C:/Users/you/AppData/Roaming/npm/node_modules/openclaw/openclaw.mjs"
   ],
   "allowFrom": ["123456789"]
 }
@@ -328,25 +280,55 @@ skill 讀的那一份。表只回答一個掃描答不了的問題——同一�
 | 欄位 | 必要 | 說明 |
 |---|---|---|
 | `projectsDir` | ✓ | 一個專案一個子目錄 |
-| `projectsFile` | | 房間 → 專案的對照表，預設 `~/.openclaw/chat-interceptor-projects.json`。帶著 chat id，所以放 state 目錄不放專案裡 |
-| `autoInstall` | | harness 跑完就把那個專案裝成 route。預設 `true`；設 `false` 就改成自己打 `/tap -install` |
-| `command` | | harness 的 argv。`prompt` 接在最後，工作目錄設成專案目錄。預設 `["claude", "-p", "--permission-mode", "bypassPermissions"]` |
-| `continueCommand` | | 這個專案跑過之後改用這組 argv，讓 harness 接續同一個 session（`claude` 就是加 `--continue`）。省略＝每一輪都從乾淨的開始 |
-| `prompt` | | 要它做什麼。預設是請它施展**它自己的** `/tap` 技能，外加一段它自己無從得知的執行條件：這一輪沒有人能回答它，所以不要停在提問就結束；它的結論會原樣交到使用者手上 |
-| `notifyCommand` | | 回報用的 argv，後面會接上 `--channel <c> --target <t> --message <text>`。預設 `["openclaw", "message", "send"]` |
-| `env` | | harness 的額外環境變數 |
-| `timeoutMs` | | 預設 `1800000`（30 分鐘） |
-| `allowFrom` | | 允許下這個指令的 sender id。**省略＝房間裡的人都可以** |
+| `projectsFile` | | 房間 → 專案的對照表（綁哪個專案、裝了沒、開著的 Claude Code），預設 `~/.openclaw/chat-interceptor-projects.json`。帶著 chat id，所以放 state 目錄不放專案裡 |
+| `ccrun` | | [ccrun](https://github.com/neritina-ai/cli-ccrun) 的 argv，預設 `["ccrun"]`。ccrun 自己要在 PATH 上找得到 `claude` |
+| `openclaw` | | openclaw CLI 的 argv，預設 `["openclaw"]`。回報用 `message send`，安裝用 `skills install` |
+| `interpreters` | | 副檔名 → 直譯器 argv，給約定之外的副檔名用 |
+| `allowFrom` | | 允許下 `/fiat` 的 sender id，疊在 OpenClaw 自己的指令授權之上。省略＝OpenClaw 認可的人都可以 |
 
-`command`、`continueCommand` 與 `notifyCommand` 一律寫**絕對路徑**——gateway 是服務
-啟動的，PATH 跟 shell 不一樣。（route 那一側就不必了，見上面的「一條 route 最少長這樣」。）
+`ccrun` 與 `openclaw` 一律寫**絕對路徑**——gateway 是服務啟動的，PATH 跟 shell 不一樣。
 
-> **`/tap` 會在這台機器上叫起一個能改檔案的 agent，`/tap -install` 還會改到 gateway
-> 自己的設定。** 房間裡的每個人都打得出這幾行，所以不是自己完全掌握的房間，
-> 一定要設 `allowFrom`——它同時管住這五個指令。
+叫起 Claude Code 時**只帶跟任務有關的東西**：工作目錄、Remote Control 的名字（就是專案名）、
+回報程式的位置。模型、effort、權限模式一概不帶，照你自己的 Claude Code 全域設定。
 
-被叫起的 harness **不知道自己是被誰叫起的**——它就是站在專案目錄裡施展 `/tap`，
-跟人從終端機叫它做的是同一件事。
+> **`/fiat` 會在這台機器上叫起一個能改檔案的 agent。** 它是需要授權的指令，
+> 不是自己完全掌握的房間，還要再設 `allowFrom`。
+
+## `/tap`
+
+<a id="tap"></a>
+
+`/tap` 是 Claude Code 這一側的技能（[Agent Skill](https://github.com/vercel-labs/skills)），
+`/fiat` 叫起 Claude Code 之後注入給它的就是這個：
+
+```bash
+npx skills add caridina-ai/openclaw-chat-interceptor --skill tap -a claude-code -g
+```
+
+| 叫法 | 那一段 |
+|---|---|
+| `/tap [yyyy-mm-dd HH:MM]` | 汲取房間的對話，寫需求文件。帶時間就從那個時間開始汲取 |
+| `go` | 照需求文件實作。在 session 裡打，或在房間打 `/fiat -go` |
+| `/tap -done` | 驗收過了：commit、寫交接 memory |
+
+汲取的結果是一條完整的時間軸：session 裡 AI 看到的那些（OpenClaw 2026.9 起在 `openclaw-agent.sqlite`，
+需要 Node 有 `node:sqlite`），加上 [offstage log](#offstage)
+裡 AI 沒看到的那些（每一則標著下場：script 接走、script 出錯、`/aside`）。
+
+每個專案用一個 `genesis/.tap` 記住自己在哪個房間出生，**只有三個欄位**：
+
+```
+channel:   telegram
+target:    -1001234567890
+timestamp: 2026-08-18 20:43:20
+```
+
+`timestamp` 是上一輪結束的時間，下一輪從這裡往後汲取；留空就是從頭。
+`/fiat` 開新專案時會寫好它，`/fiat -done` 時推到當下。**`.tap` 絕不進版控**——
+頻道位置是敏感資訊。
+
+`/tap` 不必由 `/fiat` 叫起也能用：在專案目錄裡自己打 `/tap` 就是汲取加寫需求文件，
+只是沒有人接它的回報。
 
 ## 測試
 
@@ -354,12 +336,12 @@ skill 讀的那一份。表只回答一個掃描答不了的問題——同一�
 npm test
 ```
 
-不需要 gateway、不需要網路，也不依賴任何外部 script——測試自己把 fixture
-寫進暫存目錄。
+不需要 gateway、不需要網路、不需要 Claude Code，也不依賴任何外部 script——
+測試自己把 fixture 寫進暫存目錄，ccrun 與 `openclaw message send` 也都是假的。
 
 ## 開發
 
-Plain ESM JavaScript，沒有 build step。`--link` 安裝後改完
-`src/index.js` 重啟 gateway 就生效。
+Plain ESM JavaScript，沒有 build step。`--link` 安裝後 repo 就是線上版，改完
+`src/` 跑 `openclaw plugins reload openclaw-chat-interceptor` 就生效。
 
-AI model used: Claude Opus 5.0
+AI model used: Claude Opus 5.5

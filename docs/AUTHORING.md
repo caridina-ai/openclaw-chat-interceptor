@@ -94,17 +94,14 @@ stderr 只有在你非 0 離開時才會被人看到。
 要放別的地方、或用完全不同的跑法，就在 route 寫 `command`（argv，絕對路徑）——
 那條路一直都在，只是你得自己負責那些路徑。
 
-### 有兩種訊息永遠不會到你手上
+### `/` 開頭的訊息永遠不會到你手上
 
-`/aside` 開頭的訊息（大小寫不拘）由 plugin 直接吃掉：那是使用者在記
-「這個房間用起來哪裡不順」，不是給你的指令。
+斜線指令歸 OpenClaw：`/new`、`/status` 這些，以及 plugin 註冊的 `/aside`、`/fiat`。
+plugin 看到 `/` 開頭就直接放行，不會叫你。`/aside` 是使用者在記「這個房間用起來哪裡不順」，
+`/fiat` 是使用者要叫 Claude Code 來改這個房間——都不是給你的指令。
 
-`/tap`（含 `/tap <projname>`、`/tap <projname> <yyyy-mm-dd>`）也一樣被 plugin 接走：
-那是使用者要叫一個 AI harness 回頭檢討這個房間，見 README 的
-[從聊天室裡叫起來](../README.md#tap)。只有 `/tap` 這個字算，`/tapioca` 還是你的。
-
-所以**不要自己實作這兩個**，也不必在你的規則表裡幫它們留位置——你根本收不到。
-使用者記下的 `/aside`，之後用 `/tap` 讀出來（見第 12 節）。
+所以**不要用 `/` 開頭的字當觸發詞**，也不必在你的規則表裡幫這些指令留位置——你根本收不到。
+使用者記下的 `/aside`，之後 `/tap` 會讀出來（見第 12 節）。
 
 ---
 
@@ -270,8 +267,8 @@ plugin config 是熱重載，不必重啟）。
 打開 route 的 `debug`，`~/.openclaw/logs/chat-interceptor.log` 會記下每一輪
 命中或沒命中。跑幾天，看沒命中的裡面哪一種最常出現，就寫下一條。
 
-不必自己翻 log——`/tap`（第 12 節）會把「放行給 AI 的輸入」依相同輸入分群列出來，
-**同一句話講愈多次，就愈值得寫成規則**。
+**同一句話講愈多次，就愈值得寫成規則**。`/tap`（第 12 節）還原的逐字稿裡，
+底下沒有 `↳` 標記的那些就是 AI 接手的。
 
 ### 步驟四：SKILL.md 留下來，但只寫「script 不處理的部分」
 
@@ -472,29 +469,30 @@ handled {"route":"my-skill","stdout":"server-1: OK"}
 
 ---
 
-## 12. 上線之後：用 `/tap` 檢討
+## 12. 上線之後：用 `/fiat` 與 `/tap` 檢討
 
 你的 script 上線之後，最想知道的是「還有哪些話我接不住」。但**被你 exit 0 吃掉的
 那些輸入不會進 session**，事後翻不到；使用者的抱怨更是散在對話裡。
 
-`/tap` 是這個 plugin 附的 Agent Skill，裝進 Claude Code 這類 harness：
+所以 plugin 把 AI 沒看到的每一句話都記在 offstage log 裡（見 README 的
+[offstage log](../README.md#offstage)），而 `/tap` 是這個 plugin 附的 Agent Skill，
+把它跟 session 檔合成一條完整的逐字稿：
 
 ```bash
-npx skills add caridina-ai/openclaw-chat-interceptor
+npx skills add caridina-ai/openclaw-chat-interceptor --skill tap -a claude-code -g
 ```
 
-然後在你的 script 專案裡叫它「tap 一下這個頻道」。它會給你：
+日常不必自己叫它：在房間裡打 [`/fiat`](../README.md#fiat)，Claude Code 就會在你的專案
+目錄施展 `/tap`，汲取、寫需求文件、實作、裝進房間讓你驗收。逐字稿裡看得到：
 
-- **放行給 AI 的輸入**，依相同輸入分群——這就是下一條規則要寫什麼的原料
-- **出錯的那幾輪**——使用者收到的是錯誤訊息而不是答案，優先修
 - **使用者打的 `/aside`**——他親口說的待辦，比任何推測都準
-- 完整逐字稿，每一則底下標著它當時的下場
+- **script 出錯的那幾輪**——使用者收到的是錯誤訊息而不是答案
+- **script 接走的**，連同它回了什麼；其餘沒有標記的就是 AI 接手的
 
-前提是兩件事：route 的 `debug` 要開（沒開就只有逐字稿，不知道每一則的下場），
-以及你的專案裡要有一個 `.tap` 記著房間位置（`channel` / `target` / `viewed`
-三個欄位，**不進版控**）。細節見
+前提是你的專案裡有一個 `genesis/.tap` 記著房間位置（`channel` / `target` / `timestamp`
+三個欄位，**不進版控**）。用 `/fiat` 開的專案一開始就有。細節見
 [`skills/tap/SKILL.md`](../skills/tap/SKILL.md)。
 
 ---
 
-AI model used: Claude Opus 5.0
+AI model used: Claude Opus 5.5

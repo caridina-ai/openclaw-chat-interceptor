@@ -2,11 +2,23 @@
   "id": "openclaw-chat-interceptor",
   "name": "Chat Interceptor",
   "description": "Runs a per-room script before the agent replies; falls through to the AI when the script declines.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "activation": {
     "onStartup": true,
-    "onCapabilities": ["hook"]
+    "onCapabilities": [
+      "hook"
+    ]
   },
+  "commandAliases": [
+    {
+      "name": "fiat",
+      "kind": "runtime-slash"
+    },
+    {
+      "name": "aside",
+      "kind": "runtime-slash"
+    }
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -19,69 +31,59 @@
         "type": "string",
         "description": "Absolute path of the debug trace file. Defaults to ~/.openclaw/logs/chat-interceptor.log"
       },
-      "asideLogFile": {
+      "offstageLogFile": {
         "type": "string",
-        "description": "Absolute path of the file /aside messages are appended to, one JSON object per line. Defaults to ~/.openclaw/logs/chat-interceptor-asides.log"
+        "description": "Absolute path of the file that records every message the AI never saw: turns a script handled, turns that ended in a script error, and /aside notes. One `<local time> <JSON>` line each; /tap reads it. Always on, regardless of debug. Defaults to ~/.openclaw/logs/chat-interceptor-offstage.log"
       },
-      "tap": {
+      "fiat": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["projectsDir"],
-        "description": "Enables the built-in `/tap` command: from inside a room, start an AI harness in that room's project and ask it to run its own /tap skill. Omit this block and `/tap` is left to the room's script and the AI, as before.",
+        "required": [
+          "projectsDir"
+        ],
+        "description": "Enables the /fiat command: start Claude Code (through ccrun) on the project bound to the current room and have it run its /tap skill. A project is an OpenClaw skill (SKILL.md plus scripts/intercept.*); installing it copies it into the room's agent workspace with `openclaw skills install`, and the room's route runs the installed copy. Omit this block and /fiat only says it is not configured.",
         "properties": {
           "projectsDir": {
             "type": "string",
-            "description": "Directory holding one subdirectory per project. `/tap` looks for `<project>/.tap` and `<project>/genesis/.tap` under it to find the project bound to the current room; `/tap <projname>` creates `<projectsDir>/<projname>/genesis/.tap`."
+            "description": "Directory holding one subdirectory per project. `/fiat <projname>` creates `<projectsDir>/<projname>/genesis/.tap` for a new project. A project's skill is the project folder itself when it has a SKILL.md, otherwise the one folder right under it that does."
           },
           "projectsFile": {
             "type": "string",
-            "description": "Where the room-to-project table is kept, one entry per conversation. `/tap <projname>` writes it, `/tap` reads it, `/tap -uninstall` clears it. Defaults to ~/.openclaw/chat-interceptor-projects.json. It holds conversation ids, so it lives in the state directory rather than in any project."
+            "description": "Where the room-to-project table is kept, one entry per conversation: which project the room belongs to, whether its script is installed, and the open Claude Code session. Defaults to ~/.openclaw/chat-interceptor-projects.json. It holds conversation ids, so it lives in the state directory rather than in any project."
           },
-          "command": {
+          "ccrun": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string" },
-            "description": "argv of the AI harness. `prompt` is appended as the last argument and the project directory becomes its working directory. Defaults to [\"claude\", \"-p\", \"--permission-mode\", \"bypassPermissions\"]. Use an absolute executable path: the gateway runs as a service and its PATH may differ from a shell."
+            "items": {
+              "type": "string"
+            },
+            "description": "argv of ccrun (github.com/neritina-ai/cli-ccrun), which starts Claude Code in a console of its own with Remote Control on and types prompts into it by PID. Defaults to [\"ccrun\"]. Use an absolute path: the gateway runs as a service and its PATH may differ from a shell."
           },
-          "continueCommand": {
+          "openclaw": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string" },
-            "description": "argv used instead of `command` once the harness has already run in this project, so it carries on the same session and remembers what it asked. E.g. [\"claude\", \"-p\", \"--continue\", \"--permission-mode\", \"bypassPermissions\"]. Omit to start every round fresh. Whether a project has run before is read from `projectsFile`, not guessed; a continued run that fails clears the mark so the next one starts fresh."
-          },
-          "prompt": {
-            "type": "string",
-            "description": "What to ask the harness to do. The default invokes the harness's own /tap skill and tells it the one thing it cannot know on its own: the run is non-interactive, so it must not stop at a question, and its closing summary is what reaches the user."
-          },
-          "notifyCommand": {
-            "type": "array",
-            "minItems": 1,
-            "items": { "type": "string" },
-            "description": "argv used to report a finished run back to the room; `--channel <c> --target <t> --message <text>` are appended to it. Defaults to [\"openclaw\", \"message\", \"send\"]."
-          },
-          "env": {
-            "type": "object",
-            "additionalProperties": { "type": "string" },
-            "description": "Extra environment variables for the harness, merged over the gateway's own."
-          },
-          "timeoutMs": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Kill the harness after this long. Defaults to 1800000 (30 minutes)."
-          },
-          "autoInstall": {
-            "type": "boolean",
-            "description": "After a successful harness run, install whatever `<project>/genesis/route.json` describes, unless the same route is already live. Defaults to true, so a project goes live as soon as it can run and the user can test it straight away. Set false to require an explicit `/tap -install`."
+            "items": {
+              "type": "string"
+            },
+            "description": "argv of the openclaw CLI. /fiat uses it for two things: `message send` to post into the room, and `skills install <skill> --force --agent <id>` to install a project's skill into the room's agent. Defaults to [\"openclaw\"]. Use absolute paths, e.g. [\"C:/Program Files/nodejs/node.exe\", \"<npm global root>/openclaw/openclaw.mjs\"]: the gateway runs as a service and its PATH may differ from a shell."
           },
           "interpreters": {
             "type": "object",
-            "additionalProperties": { "type": "array", "minItems": 1, "items": { "type": "string" } },
-            "description": "How to run a script by file extension, as an argv prefix that the script path is appended to. Example: a .py entry of [C:/tools/uv.exe, run] makes the route run that script with uv. Only needed for extensions the plugin cannot resolve itself: .mjs/.js/.cjs always use the gateway own Node binary, and .py falls back to uv (then python) found on PATH at install time."
+            "additionalProperties": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "How to run a project script by file extension, as an argv prefix that the script path is appended to. Example: a .py entry of [C:/tools/uv.exe, run]. Only needed for extensions the plugin cannot resolve itself: .mjs/.js/.cjs always use the gateway's own Node binary, and .py falls back to uv (then python) found on PATH."
           },
           "allowFrom": {
             "type": "array",
-            "items": { "type": "string" },
-            "description": "Sender ids allowed to run `/tap`. Omit to allow anyone in the room. `/tap` starts an agent that can write files on this machine, so set this for any room you do not fully control."
+            "items": {
+              "type": "string"
+            },
+            "description": "Sender ids allowed to run /fiat, on top of OpenClaw's own command authorization. Omit to allow every authorized sender. /fiat starts an agent that can write files on this machine."
           }
         }
       },
@@ -91,7 +93,9 @@
         "items": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["target"],
+          "required": [
+            "target"
+          ],
           "properties": {
             "name": {
               "type": "string",
@@ -107,12 +111,14 @@
             },
             "project": {
               "type": "string",
-              "description": "Name of a directory under tap.projectsDir. The script and the interpreter are worked out by convention every time the route runs: scripts/intercept.{mjs,js,cjs,py} inside that project, run with the gateway own Node for JavaScript or with uv (then python) for Python. Nothing machine-specific ends up in the config, so it keeps working across Node and uv upgrades. Give this or command."
+              "description": "Name of a directory under fiat.projectsDir. The script and the interpreter are worked out by convention every time the route runs: scripts/intercept.{mjs,js,cjs,py} inside that project, run with the gateway's own Node for JavaScript or with uv (then python) for Python. Nothing machine-specific ends up in the config, so it keeps working across Node and uv upgrades. Give this or command."
             },
             "command": {
               "type": "array",
               "minItems": 1,
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "description": "argv of the script, as an escape hatch when the project convention does not fit. Wins over project. Use absolute executable paths: the gateway runs as a service and its PATH may differ from a shell."
             },
             "cwd": {
@@ -121,7 +127,9 @@
             },
             "env": {
               "type": "object",
-              "additionalProperties": { "type": "string" },
+              "additionalProperties": {
+                "type": "string"
+              },
               "description": "Extra environment variables merged over the gateway's own."
             },
             "timeoutMs": {
@@ -130,7 +138,10 @@
               "description": "Kill the script after this long. Defaults to 15000."
             },
             "onError": {
-              "enum": ["handle", "passthrough"],
+              "enum": [
+                "handle",
+                "passthrough"
+              ],
               "description": "What to do when the script fails. \"handle\" (default) replies with the error; \"passthrough\" hands the turn to the AI. Only use passthrough for scripts with no side effects."
             }
           }

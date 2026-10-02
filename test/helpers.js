@@ -1,0 +1,175 @@
+// 測試共用。不需要 gateway、網路、Claude Code 或任何使用者的 script：
+// 要跑的東西全是寫進暫存目錄的 fixture。
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import entry from "../src/index.js";
+
+export const PLUGIN_ID = "openclaw-chat-interceptor";
+export const TELEGRAM_CHAT = "-1001234567890";
+export const DISCORD_CHAT = "123456789012345678";
+export const OTHER_CHAT = "-1009876543210";
+
+export const READ_STDIN = `
+let raw = "";
+for await (const chunk of process.stdin) raw += chunk;
+const payload = JSON.parse(raw.replace(/^\\uFEFF/, "").trim() || "{}");
+`;
+
+export function tempDir(prefix) {
+  return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/** 剛結束的子行程在 Windows 上還抓著檔案；刪不掉也不算測試失敗，那只是暫存目錄。 */
+export async function removeLater(dir) {
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
+  } catch {
+    // 留著就留著
+  }
+}
+
+/** 寫一支 fixture script，回傳跑它的 argv。 */
+export function fixture(dir, name, source) {
+  const file = join(dir, name);
+  writeFileSync(file, source, "utf8");
+  return [process.execPath, file];
+}
+
+/** 把 plugin 註冊到一個假的 api 上，拿回 hook 與兩個指令。 */
+export function register() {
+  const commands = {};
+  let hook;
+  entry.register({
+    pluginConfig: {},
+    logger: { info() {}, warn() {}, error() {} },
+    on(name, handler) {
+      if (name === "before_dispatch") hook = handler;
+    },
+    registerCommand(definition) {
+      commands[definition.name] = definition;
+    },
+  });
+  assert.ok(hook, "before_dispatch handler was not registered");
+  return { hook, commands };
+}
+
+/** offstage log 一行一筆 `<當地時間> <JSON>`。 */
+export function readOffstage(file) {
+  return (existsSync(file) ? readFileSync(file, "utf8") : "")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => {
+      const match = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (\{.*\})$/.exec(line);
+      assert.ok(match, `offstage line is not "<local stamp> <json>": ${line}`);
+      return { ts: match[1], ...JSON.parse(match[2]) };
+    });
+}
+
+export const readJson = (file) => {
+  if (!existsSync(file)) return null;
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return null; // 還在寫
+  }
+};
+
+/** 一行一筆 JSON 的紀錄檔（fixture 用 appendFileSync 寫的那種）。 */
+export const readJsonLines = (file) =>
+  (existsSync(file) ? readFileSync(file, "utf8") : "")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+
+/** 背景跑的東西，等它的產物出現，而不是等呼叫的人回來。 */
+export async function waitFor(read, label) {
+  for (let i = 0; i < 400; i += 1) {
+    const value = read();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
+// Windows 的 temp 目錄可能是 8.3 短檔名，子行程回報的卻是長的。
+export const samePath = (a, b) => realpathSync(a).toLowerCase() === realpathSync(b).toLowerCase();
+
+/**
+ * 假的 ccrun。每一次被叫都在 CCRUN_LOG 記一行，行為照 ccrun 的介面：
+ *   -d <dir> <prompt>   印出 pid（CCRUN_PID，預設 4242）；CCRUN_FAIL 有值就失敗
+ *   -p <pid> -s         pid 列在 CCRUN_ALIVE 裡才成功
+ *   -p <pid> <text>     同上，成功時記下打了什麼
+ */
+export function fakeCcrun(dir) {
+  return fixture(
+    dir,
+    "ccrun.mjs",
+    `
+    const fs = await import("node:fs");
+    const args = process.argv.slice(2);
+    const log = (entry) => fs.appendFileSync(process.env.CCRUN_LOG, JSON.stringify(entry) + "\\n", "utf8");
+    if (args[0] === "-d") {
+      await new Promise((r) => setTimeout(r, Number(process.env.CCRUN_DELAY || 0)));
+      log({ mode: "launch", dir: args[1], prompt: args[2], report: process.env.FIAT_REPORT, context: process.env.FIAT_CONTEXT });
+      if (process.env.CCRUN_FAIL) { process.stderr.write(process.env.CCRUN_FAIL); process.exit(1); }
+      process.stdout.write((process.env.CCRUN_PID || "4242") + "\\n");
+      process.exit(0);
+    }
+    const alive = String(process.env.CCRUN_ALIVE || "").split(",").includes(args[1]);
+    if (!alive) { process.stderr.write("pid " + args[1] + " is not claude.exe"); process.exit(1); }
+    if (args[2] === "-q") log({ mode: "quit", pid: Number(args[1]) });
+    else if (args[2] !== "-s") log({ mode: "inject", pid: Number(args[1]), text: args[2] });
+    process.exit(0);`,
+  );
+}
+
+/**
+ * 假的 `openclaw` CLI，只會兩件事：
+ *   message send …                         把 send 之後的參數記進 NOTIFY_LOG，一行一次
+ *   skills install <dir> --force --agent X  複製進 FAKE_WORKSPACE/<agent>/skills/<slug>，
+ *                                          記進 INSTALL_LOG，印出跟真的一樣的那一行
+ *                                          FAKE_INSTALL_EPERM 有設：學 Windows 上真的發生過的那樣，
+ *                                          舊的那份搬走了、新的改名失敗、也沒還原回去
+ */
+export function fakeOpenclaw(dir) {
+  return fixture(
+    dir,
+    "openclaw.mjs",
+    `
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const args = process.argv.slice(2);
+    if (args[0] === "message" && args[1] === "send") {
+      fs.appendFileSync(process.env.NOTIFY_LOG, JSON.stringify(args.slice(2)) + "\\n", "utf8");
+      process.exit(0);
+    }
+    if (args[0] === "skills" && args[1] === "install") {
+      const source = args[2];
+      const agent = args.includes("--agent") ? args[args.indexOf("--agent") + 1] : "default";
+      const name = /^name:\\s*"?([^"\\r\\n]+?)"?\\s*$/m.exec(fs.readFileSync(path.join(source, "SKILL.md"), "utf8"))?.[1];
+      const slug = name || path.basename(source);
+      const target = path.join(process.env.FAKE_WORKSPACE, agent, "skills", slug);
+      if (fs.existsSync(target) && !args.includes("--force")) { process.stderr.write("already installed"); process.exit(1); }
+      fs.rmSync(target, { recursive: true, force: true });
+      if (process.env.FAKE_INSTALL_EPERM) { process.stderr.write("failed to install skill: Error: EPERM: operation not permitted, rename"); process.exit(1); }
+      fs.cpSync(source, target, { recursive: true });
+      if (process.env.INSTALL_LOG) fs.appendFileSync(process.env.INSTALL_LOG, JSON.stringify({ source, agent, force: args.includes("--force") }) + "\\n", "utf8");
+      process.stdout.write("Installed " + slug + " from path -> " + target + "\\n");
+      process.exit(0);
+    }
+    process.stderr.write("unexpected: " + args.join(" "));
+    process.exit(1);`,
+  );
+}
+
+/** 一個專案裡的 skill：`<專案>/<skill>/SKILL.md` 與 `scripts/intercept.mjs`。回傳 skill 目錄。 */
+export function seedSkill(projectDir, name, script) {
+  const skill = join(projectDir, name);
+  mkdirSync(join(skill, "scripts"), { recursive: true });
+  writeFileSync(join(skill, "SKILL.md"), `---\nname: ${name}\ndescription: test skill\n---\n\n# ${name}\n`, "utf8");
+  if (script !== null) writeFileSync(join(skill, "scripts", "intercept.mjs"), script ?? "process.exit(20);", "utf8");
+  return skill;
+}

@@ -1,81 +1,97 @@
 # openclaw-chat-interceptor 技術設計
 
-這份文件說明 `before_agent_reply` 這條路徑怎麼運作、plugin 這一側怎麼實作，
+這份文件說明 `before_dispatch` 這條路徑怎麼運作、plugin 這一側怎麼實作，
 以及職責邊界劃在哪裡。**要寫 script 的人請看 [AUTHORING.md](AUTHORING.md)**，
 這份是內部設計。
 
-所有關於 OpenClaw 行為的敘述都對照過 `2026.7.1-2` 的發行原始碼
-（`<npm global root>/openclaw/dist`）。
+所有關於 OpenClaw 行為的敘述都對照過發行原始碼（`<npm global root>/openclaw/dist`）：
+第 1 節是 `2026.9.6`，其餘是 `2026.7.1-2`。
 
 ---
 
-## 1. `before_agent_reply` 是什麼
+## 1. `before_dispatch` 是什麼
 
 OpenClaw 有兩套 hook，名字很像但完全不同：
 
 | | internal hooks | **typed plugin hooks** |
 |---|---|---|
 | 形式 | `~/.openclaw/hooks/<name>/HOOK.md` + `handler.ts` | plugin 裡 `api.on(name, handler)` |
-| 事件 | `command:new`、`message:received`、`gateway:startup`… | `before_tool_call`、**`before_agent_reply`**、`message_sending`… |
+| 事件 | `command:new`、`message:received`、`gateway:startup`… | `before_tool_call`、**`before_dispatch`**、`message_sending`… |
 | 能力 | 觀察 + 副作用 | 可以 **block / cancel / 短路** |
 | 文件 | `docs/automation/hooks.md` | `docs/plugins/hooks.md` |
 
-`before_agent_reply` 只存在於第二套。**所以 openclaw-chat-interceptor 必須是 plugin，
+`before_dispatch` 只存在於第二套。**所以 openclaw-chat-interceptor 必須是 plugin，
 不能是 skill，也不能是 `~/.openclaw/hooks/` 底下的 internal hook。**
 
 ### 它在哪裡被呼叫
 
-`dist/get-reply-*.js`，`getReply()` 之中。時序是：
+`dist/dispatch-from-config-*.mjs`，`dispatchReplyFromConfig()` 之中。時序是：
 
 ```
 telegram 收到訊息
   ↓
-決定 session / agent / model（還沒送任何東西給模型）
+prepareDispatchOperation   ← 只處理 /stop、/approve 這種要插隊的
   ↓
-if (hookRunner.hasHooks("before_agent_reply"))
-      hookResult = runBeforeAgentReply({ cleanedBody }, ctx)
-      if (hookResult?.handled)
-          return hookResult.reply ?? { text: "NO_REPLY" }   ← 從這裡直接跳出
+chooseDispatchRoute:
+  if (hookRunner.hasHooks("before_dispatch"))
+      result = runBeforeDispatch({ body, channel, sessionKey, senderId, … }, ctx)
+      if (result?.handled)
+          有 text 就送出；記成 completed，return   ← 從這裡直接跳出
   ↓
-stage media → runPreparedReply()   ← 組 prompt、送模型、跑 tool、寫 session 歷史
+executeDispatch → getReply()   ← 處理斜線指令、把這句話寫進 session、
+                                  before_agent_reply、組 prompt、送模型、跑 tool
 ```
 
-`handled: true` 是**整個 agent turn 的短路**，不是「先回一句再繼續」：
+`handled: true` 是**整則訊息的短路**，不是「先回一句再繼續」：
 
-- 不組 system prompt、不載入 session 歷史、不呼叫模型 → **0 token**
-- 不寫進 session transcript → 這一輪對後續對話是隱形的
-- 回傳的 `reply` 直接進入正常的 outbound pipeline，使用者在 telegram 看到的
-  跟 AI 回的沒有差別
+- 不處理指令、不寫進 session transcript、不呼叫模型 → **0 token**，這一輪對後續對話是隱形的
+- `text` 直接送回原本的對話，使用者看到的跟 AI 回的沒有差別
+- 不帶 `text` 就是靜默，不會被補「沒有產生回覆」的警告
+
+**斜線指令也會先經過這裡**，因為指令是在 `getReply()` 裡才處理的。所以 plugin 看到
+`/` 開頭的訊息一律放行、不送 script——否則回覆所有訊息的 script 會把 `/new`、
+`/status` 吃掉。`/aside`、`/fiat` 在 telegram 是原生指令，走另一條路，碰不到這個 hook。
+
+### 為什麼不是 `before_agent_reply`
+
+2026.9 以前用的是它：在 `getReply()` 裡、模型之前，handled 一樣短路，而且指令已經處理完了。
+2026.9 起它有兩個問題：
+
+1. **使用者那句話在它之前就寫進 session 了**（`admitUserTurn`）。script 接走的話 AI
+   下一輪照樣看得到——實際上鍵盤按鍵的 `callback_data: …` 就這樣一則則進了 AI 的 session。
+2. **群組訊息預設一定要回話**（`agents.defaults.silentReply.group` 預設 `disallow`）。
+   handled 但不帶 reply 時 OpenClaw 補的 `NO_REPLY` 不算數，使用者會收到
+   「I finished the turn, but it did not produce a visible reply.」
+
+第 2 點設定改得掉，第 1 點改不掉，所以換 hook。
 
 ### 介面
 
 ```ts
-// 收到
-type PluginHookBeforeAgentReplyEvent = { cleanedBody: string };
+// 收到（只列本專案用到的）
+type Event = { body?: string; content?: string; channel?: string; sessionKey?: string; senderId?: string };
 
-// 回傳（回 undefined = 什麼都沒發生，照原流程給 AI）
-type PluginHookBeforeAgentReplyResult = {
-  handled: boolean;
-  reply?: ReplyPayload;   // { text: "..." } 就夠了
-  reason?: string;        // 只進 log，不給使用者看
-};
+// 回傳（回 undefined = 什麼都沒發生，照原流程）
+type Result = { handled: boolean; text?: string };
 ```
 
-第二個參數 `ctx` 是 `PluginHookAgentContext`，本專案會用到的欄位：
+第二個參數 `ctx` 本專案會用到的欄位：
 
-| 欄位 | telegram 群組 | discord channel |
-|---|---|---|
-| `ctx.channel` / `ctx.messageProvider` | `"telegram"` | `"discord"` |
-| `ctx.chatId` / `ctx.channelId` | `"-1001234567890"` | `"123456789012345678"` |
-| `ctx.sessionKey` | `telegram:group:-1001234567890` | `discord:channel:123456789012345678` |
-| `ctx.agentId` | 這個房間綁定的 agent id | |
-| `ctx.pluginConfig` | 本 plugin 在 openclaw.json 裡的 `config` 區塊 | |
+| 欄位 | telegram 群組 |
+|---|---|
+| `event.channel` / `ctx.channelId` | `"telegram"` |
+| `ctx.conversationId` | `"-1001234567890"` |
+| `ctx.sessionKey` | `agent:<agentId>:telegram:group:-1001234567890` |
+| `ctx.senderId` | 發話者 |
+| `ctx.pluginConfig` | 本 plugin 在 openclaw.json 裡的 `config` 區塊（沒給就用 `api.pluginConfig`） |
+
+沒有 `agentId`：這個房間綁的 agent 從 sessionKey 的 `agent:<agentId>:` 取。
 
 ### 對話 id 的三種寫法（跨 channel 的坑）
 
 session key 的格式是 `[agent:<agentId>:]<channel>:<group|channel>:<rawId>`
 （`parseRawSessionConversationRef`，`dist/session-key-utils-*.js`），
-`ctx.chatId` 就是其中的 `rawId`——**已經剝掉 prefix 的裸 id**。
+`ctx.conversationId` 就是其中的 `rawId`——**已經剝掉 prefix 的裸 id**。
 
 但使用者在 CLI 看到的不是這個：
 
@@ -85,7 +101,7 @@ openclaw message send --channel discord  --target channel:123456789012345678
 ```
 
 telegram 的 target 是裸 id，discord 的卻帶 `channel:` prefix。如果設定欄位直接拿去
-跟 `ctx.chatId` 做字串比對，telegram 會過、**discord 會永遠對不上**。
+跟 `ctx.conversationId` 做字串比對，telegram 會過、**discord 會永遠對不上**。
 
 所以本專案的 `target` 欄位兩邊都先正規化再比：剝掉 OpenClaw 自己那組
 conversation prefix（`channel` `chat` `direct` `dm` `group` `thread` `user`）
@@ -96,18 +112,17 @@ conversation prefix（`channel` `chat` `direct` `dm` `group` `thread` `user`）
 ```
 
 剝到認不得的 prefix 就停手，所以 matrix 的 `!abc:matrix.org` 不會被誤傷。
-`ctx.chatId` 萬一缺席，還會退一步自己去解 `ctx.sessionKey`。
+`ctx.conversationId` 萬一缺席，還會退一步自己去解 `ctx.sessionKey`。
 
 ### 兩個一定會踩到的限制
 
-1. **`before_agent_reply` 是 conversation hook。** 非 bundled 的 plugin 註冊它會被
-   直接擋掉，除非設 `plugins.entries.<id>.hooks.allowConversationAccess = true`。
-   被擋時 plugin 仍會「載入成功」，只是 `hookCount: 0`，很容易誤判成程式沒寫對——
-   要用 `openclaw plugins inspect <id> --runtime --json` 看 `diagnostics` 才知道。
-   （原始碼：`dist/registry-*.js` 的 `isConversationHookName` 那段。）
+1. **`hooks.allowConversationAccess` 留著。** `before_dispatch` 不是 conversation hook，
+   不靠它也註冊得上（`before_agent_reply` 是，當年沒它就被擋）。但它也是 OpenClaw 認的
+   「啟動時就載入」訊號，見下一條。被擋或沒載入時 plugin 照樣「載入成功」，
+   要用 `openclaw plugins inspect <id> --runtime --json` 看 `typedHooks` 與 `diagnostics` 才知道。
 
 2. **`activation.onStartup` 必須是 `true`。** hook 是在 plugin `register()` 時註冊的；
-   plugin 沒在 gateway 啟動時載入，`hasHooks("before_agent_reply")` 就是 false，
+   plugin 沒在 gateway 啟動時載入，`hasHooks("before_dispatch")` 就是 false，
    hook 永遠不會跑。
 
 ---
@@ -120,12 +135,15 @@ conversation prefix（`channel` `chat` `direct` `dm` `group` `thread` `user`）
 openclaw-chat-interceptor/
 ├── package.json                # openclaw.extensions 指向 src/index.js
 ├── openclaw.plugin.json        # plugin manifest：id / activation / configSchema
-├── src/index.js                # 只做路由與呼叫（plain ESM，沒有 build step）
-├── test/hook.test.js           # node --test，不需要 gateway
-├── skills/tap/                 # /tap：給 AI harness 裝的檢討工具（見 2.8）
+├── src/
+│   ├── index.js                # hook 與兩個 slash command（plain ESM，沒有 build step）
+│   ├── core.js                 # plugin 與回報程式共用：房間、對照表、.tap、script、ccrun
+│   └── report.mjs              # 回報程式：Claude Code 每一段結束時呼叫（見 2.9）
+├── test/*.test.js              # node --test，不需要 gateway、不需要 Claude Code
+├── skills/tap/                 # /tap：給 Claude Code 裝的技能（見 2.8）
 │   ├── SKILL.md
 │   └── tap.mjs
-├── genesis/FIATLUX.md          # 本專案的原始委託書
+├── genesis/                    # 本專案的委託書：FIATLUX.md 與後續的 FIAT-*.md
 └── docs/
     ├── AUTHORING.md            # 給 script 作者
     └── DESIGN.md               # 本檔
@@ -146,21 +164,19 @@ script 專案（見 AUTHORING.md）。測試用的是寫進暫存目錄的 fixtu
 plugin 本身**不含任何領域邏輯**，只做路由：
 
 ```
-selectRoute(ctx, config)        依序找第一個 channel + target 都對上的 route
-  ↓
-body 是 /tap？ → 叫起 AI harness，handled（見 2.9；這一步不需要 route）
-  ↓ 不是
+selectRoute(ctx, config)        設定裡的 route 優先，其次是對照表裡裝上的專案
   ↓ 沒有 route → return undefined（整輪給 AI）
-body 是 /aside？ → 寫進 asideLogFile，handled 但不回話（見 2.7；不需要 route）
-  ↓ 不是
 spawn route.command，stdin 餵 JSON payload
   ↓
-exit 0  → { handled: true, reply: { text: stdout } }   （stdout 空 → 靜默）
+exit 0  → { handled: true, text: stdout }   （stdout 空 → 不帶 text，靜默）  → 記進 offstage log
 exit 20 → return undefined（給 AI）
-其他    → 依 route.onError 決定 handled 或 passthrough
+其他    → 依 route.onError 決定 handled（記進 offstage log）或 passthrough
 ```
 
-五個刻意的設計決定：
+`/aside` 與 `/fiat` 不在這條路上：它們是 OpenClaw 的 slash command（見 2.7、2.9），
+在 agent 之前就被 OpenClaw 的指令流程接走了，根本不會走到這個 hook。
+
+六個刻意的設計決定：
 
 - **route 可以只寫 `project`，要跑什麼每次派工時才推。** OpenClaw 沒有「給我一支
   script、我來找直譯器」這種機制——plugin SDK 的執行介面是
@@ -177,7 +193,10 @@ exit 20 → return undefined（給 AI）
 - **同一個 route 一次只跑一支 script。** script 常會寫檔或寫 DB，
   兩則訊息同時進來會互相蓋掉。
 - **`debug: true` 時每一輪都寫 trace 到 `~/.openclaw/logs/chat-interceptor.log`**，
-  包含沒攔到的那些。這是唯一的觀測窗口——gateway 主 log 是 JSON 巨獸，很難看。
+  包含沒攔到的那些。這是 plugin 的除錯窗口——gateway 主 log 是 JSON 巨獸，很難看。
+- **AI 沒看到的每一句話都記進 offstage log，一直開著。** script 接走的、script 出錯而
+  回了錯誤訊息的，都不進 session；不記下來，事後就沒有人知道使用者講過。放行給 AI 的
+  不記，session 裡本來就有。它跟 `debug` 無關：那是除錯，這是對話紀錄。
 
 ### 2.3 script 協定
 
@@ -206,7 +225,8 @@ script 自己處理。
 openclaw plugins install --link <path to this repo>
 ```
 
-`--link` 不複製檔案，只在 `plugins.load.paths` 記一筆路徑，改 code 立刻生效。
+`--link` 不複製檔案，只在 `plugins.load.paths` 記一筆路徑：repo 就是線上版，
+改完 `openclaw plugins reload openclaw-chat-interceptor` 就生效。
 
 然後 `~/.openclaw/openclaw.json`（完整範例見 README）：
 
@@ -235,7 +255,7 @@ openclaw plugins install --link <path to this repo>
 
 `channels.telegram.groupPolicy` 預設是 `allowlist`。群組沒列在
 `channels.telegram.groups` 裡，訊息在 **channel ingress 就被丟掉**了，
-`before_agent_reply` 根本不會跑。這一步很容易漏掉，症狀是
+`before_dispatch` 根本不會跑。這一步很容易漏掉，症狀是
 「hook 完全沒反應但 plugin 一切正常」。
 
 所以要在新房間架服務，一定要先把該群組加進 `channels.telegram.groups`
@@ -275,7 +295,7 @@ openclaw plugins inspect openclaw-chat-interceptor --runtime --json
 要看到：
 
 ```json
-"typedHooks": [{ "name": "before_agent_reply", "priority": 100 }],
+"typedHooks": [{ "name": "before_dispatch", "priority": 100 }],
 "diagnostics": []
 ```
 
@@ -283,12 +303,9 @@ openclaw plugins inspect openclaw-chat-interceptor --runtime --json
 
 ### 2.7 `/aside`
 
-`/aside ＿＿` 由 plugin 直接吃掉：不呼叫模型、不跑 script、不回話，
-只往 `asideLogFile` append 一行 `<當地時間> <JSON>`。
-
-```js
-const ASIDE_RE = /^\/aside(?:@\S+)?(?![\w-])([\s\S]*)$/i;
-```
+`/aside ＿＿` 是 plugin 用 `api.registerCommand()` 註冊的 OpenClaw slash command：
+不呼叫模型、不跑 script、不回話（`{ suppressReply: true }`），只往 offstage log
+append 一行 `<當地時間> {"kind":"aside", …}`。
 
 幾個刻意的決定：
 
@@ -296,129 +313,165 @@ const ASIDE_RE = /^\/aside(?:@\S+)?(?![\w-])([\s\S]*)$/i;
   這就是定義。它曾經叫 `ISSUE`，但那個名字宣稱了「這是軟體的問題」，
   而使用者留的話多半不是；他只是不想讓那句話被任何人處理。
 
-- **只認 `/aside` 這個開頭，後面接什麼就原樣記什麼。** 標點不另外判斷。
-  `(?![\w-])` 是必要的，否則 `/asidebar` 會被當成指令吃掉；
-  `(?:@\S+)?` 是因為 telegram 在群組裡會把指令寫成 `/aside@botname`。
+- **是 slash command，不是 hook 裡的字串比對。** 它本來就一定不會叫 AI，沒有理由走
+  「先攔、再判斷」那條路。掛成指令之後 OpenClaw 自己處理 `/aside@botname`、
+  Telegram 的指令選單也看得到它。
 
-- **排在所有東西前面，而且每個房間的行為都一樣。** 有沒有 route、有沒有專案、
-  `debug` 開不開，都不影響。使用者要的是「我在這裡留一句，誰都不要理」；
-  這件事如果在某些房間會突然叫醒 AI，他每次開口前都得先想「這間算不算」，
-  那就不是一個他敢用的東西了。斜線指令也打不出意外，不必擔心誤攔。
-- **這是 plugin 的事，不是 script 的事。** 放進 script 就變成「每支 script 各自實作
-  一次，而且各自可能忘記」；使用者要的是一個**在每個房間都一定成立**的約定。
-- **另開一個檔，不寫進 `logFile`。** 那個檔記的是異常（放行、出錯），
-  把使用者的抱怨堆進去等於把兩種完全不同的東西混在一起；而且它不該因為
-  某人沒開 `debug` 就消失。一行一筆 JSON：多行原文照原樣保留，
-  又不必自己發明跳脫規則。
-- **當地時間，不用 ISO。** 這個檔是拿來跟聊天室看到的時間、跟 `.tap` 的
-  `viewed:` 對照的，同一個尺規才不必換算時區，比大小也直接字串比就好。
+- **每個房間的行為都一樣，而且誰都能用**（`requireAuth: false`）。有沒有 route、
+  有沒有專案，都不影響。使用者要的是「我在這裡留一句，誰都不要理」；這件事如果在
+  某些房間會突然叫醒 AI，他每次開口前都得先想「這間算不算」，那就不是一個他敢用的東西了。
+
+- **跟被攔下的訊息記在同一個檔。** 兩者是同一回事：AI 沒看到的話。分兩個檔，
+  還原對話的人就得合兩次。
+
 - **寫失敗要回話。** 使用者要的是「記一下、不要有反應」，但「沒記到卻也沒反應」
   就是把他的話默默弄丟了，所以那一則回 `aside not recorded: …`。
 
 ### 2.8 `/tap`：被攔掉的輸入怎麼還原
 
 `handled: true` 的那一輪不進 session transcript——這是 0 token 的必然代價，
-也是檢討時最大的障礙：**最需要看的「script 還接不住哪些話」正好是看不到的那些。**
+也是回頭檢討時最大的障礙：**最需要看的「script 還接不住哪些話」、「使用者抱怨了什麼」
+正好是看不到的那些。**
 
 `skills/tap/` 是一個 [Agent Skill](https://github.com/vercel-labs/skills)
-（`npx skills add`，裝進 Claude Code 這類 harness），把五個本機來源合併還原：
+（`npx skills add`，裝進 Claude Code），`tap.mjs` 把五個本機來源合併還原：
 
 | # | 來源 | 給得出什麼 |
 |---|---|---|
-| 1 | `<sessionId>.trajectory.jsonl` 的 prompt | `Conversation info` 的 message id，以及 `Conversation context` 那幾行「AI 沒被叫醒也看得到的鄰近訊息」——**被攔截的訊息從這裡漏出來** |
+| 1 | `<sessionId>.trajectory.jsonl` 的 prompt | `Conversation info` 的 message id 與發話者，以及 `Conversation context` 那幾行「AI 沒被叫醒也看得到的鄰近訊息」 |
 | 2 | `<sessionId>.jsonl`（含 `.reset.`／`.deleted.`） | 乾淨的 `role:user` 原文，但沒有 message id |
 | 3 | `agent/codex-home/sessions/**/rollout-*.jsonl` | runtime 的另一份副本，補 1 已被輪替掉的部分 |
-| 4 | `logFile`（要 `debug: true`） | **每一輪的下場**：攔下、放行、出錯 |
-| 5 | `asideLogFile` | `/aside`，只有這裡有 |
+| 4 | offstage log | AI 沒看到的那些：script 接走、script 出錯、`/aside` |
+| 5 | `agent/openclaw-agent.sqlite`（OpenClaw 2026.9 起） | session 全搬進這裡，1、2 從此不再長大。`transcript_events` 的使用者發言直接帶 message id 與發話者；一部分 event 是 zstd 壓縮存的；被換掉的 session 封存在 `session_transcript_archives`。唯讀開啟，gateway 正開著它 |
 
 1～3 都會有缺漏（session 輪替、context window 裁切），合併後才接近完整。
-同一則訊息可能同時出現在三個來源，工具用「第一行原文相同且時間相差 5 分鐘內」
-收斂成同一則，否則檢討的人會以為使用者把同一件事講了三次。
+同一則訊息可能同時出現在 session 與 offstage log（被攔下的那則，後來又出現在別一輪的
+context 裡），工具用「第一行原文相同且時間相差 5 分鐘內」收斂成同一則，
+否則讀的人會以為使用者把同一件事講了兩次。
 
 一個實務上會炸掉的細節：按鍵（callback）在 transcript 裡帶的是 1e18 等級的**偽
 message id**，不是 telegram 的 id。缺漏偵測若照著 id 範圍從頭數到尾，會直接
 `RangeError` 而整支工具掛掉——所以掃描範圍設了上限，超過就放棄缺漏偵測並誠實說明。
 **汲取對話是主要目的，缺漏清單只是附帶資訊，不該讓附帶資訊弄死主要目的。**
 
-房間位置寫在各專案自己的 `.tap`（`channel` / `target` / `viewed` 三個欄位，
-不進版控）。細節見 [`skills/tap/SKILL.md`](../skills/tap/SKILL.md)。
+房間位置寫在各專案自己的 `genesis/.tap`（`channel` / `target` / `timestamp` 三個欄位，
+不進版控）。`timestamp` 是上一輪結束的時間，汲取從那裡開始。
 
-### 2.9 房間裡的 `/tap`
+SKILL.md 分三段：`/tap [起點]` 汲取並寫 FIAT 文件、收到 `go` 實作、
+`/tap -done` commit 並寫交接 memory。每一段最後都呼叫回報程式。
+**SKILL.md 只寫 Claude Code 需要知道的事**——回報程式背後還會做什麼，它不需要知道。
 
-2.8 那個 skill 要人走到終端機、切到專案目錄、叫起 harness、請它施展 `/tap`。
-四步裡沒有一步需要判斷，所以 plugin 也接了一個 `/tap`，讓那四步在房間裡一句話完成：
+### 2.9 `/fiat`：在房間裡把軟體生出來
+
+`/fiat` 也是 `api.registerCommand()` 註冊的 slash command，**不在 hook 裡**：它叫起的
+Claude Code 只會收到固定的 `/tap [起點]`、`go`、`/tap -done`，完全不需要
+「先攔下來看看」那一套。
+
+**`-go` 只有一個意思：這個房間的專案，接下來一路自動做到裝好。** 還沒開 session 就是連續版；
+已經開著（例如停在 FIAT 文件等人看），就注入 `go` 請它接著做。主述者在 Remote Control
+打 `go` 也一樣，但那條路壞了、或 FIAT 文件一時看不到時，房間裡的 `/fiat -go` 是唯一的路。
 
 | 訊息 | plugin 做的事 |
 |---|---|
-| `/tap <projname>` | 在 `projectsDir` 底下寫一個新的 `genesis/.tap`，並在對照表登記這個房間 |
-| `/tap <projname> <yyyy-mm-dd>` | 同上，並把起點寫進 `viewed:` |
-| `/tap` | 查對照表找出這個房間的專案 |
-| `/tap -uninstall` | 拆掉 route，並把對照表那一筆清掉 |
-| `/tap -install` | 手動上線，`autoInstall: false` 時才用得到 |
+| `/fiat <projname>` | 目錄不存在：開新專案（寫 `genesis/.tap` 與 `.gitignore`），在對照表綁定這個房間 |
+| `/fiat` | 查對照表找出這個房間的專案 |
+| `/fiat ?`（或 `？`） | 讀對照表、`.tap` 與設定裡的 route 回報狀況。不叫起、不改任何東西，也不列路徑——房間裡的人都看得到 |
+| `… -t yyyy-mm-dd HH:MM` | 注入的變成 `/tap yyyy-mm-dd HH:MM` |
+| `… -go` | 對照表那一筆記上 `go` |
+| `/fiat -go` | session 開著：注入 `go`。沒開：連續版（上一列） |
+| `/fiat -done` | 注入 `/tap -done` |
+| `/fiat -install [projname]` | `openclaw skills install` 把專案的 skill 裝進這個房間的 agent，對照表記下裝上去的那一份 |
+| `/fiat -uninstall` | 清掉對照表那一筆，拿掉裝上去的 skill |
 
-前三條合流之後做同一件事：`cwd` 設成專案目錄，把 `tap.command` 叫起來，最後一個
-參數是 `tap.prompt`。跑完之後如果專案裡有 script，就順手把那個專案裝成 route
-（`autoInstall`，預設開著）——使用者要的是「改完就能測」，而上線這一步沒有任何判斷。
+前兩列（加上沒開 session 時的 `-go`）合流之後做同一件事：`ccrun -d <專案目錄> "/tap [起點]"`，
+環境變數多帶兩個——`FIAT_REPORT`（回報程式的位置）與 `FIAT_CONTEXT`（房間、專案、
+agent、對照表、ccrun 與 openclaw CLI 的 argv）。ccrun 回傳的 pid 記進對照表，那就是之後 `-go`、`-done`
+與回報程式找到這個 session 的把手。
 
-**注意這是兩個不同的 `/tap`**：使用者在房間裡打的那個由本 plugin 攔截，
-harness 施展的那個是 2.8 的 Agent Skill。名字一樣是刻意的（使用者只需要記一個字），
-但它們是兩層。而**被叫起的 harness 不知道自己是被誰叫起的**——這是刻意的：
-從終端機叫它做的是一模一樣的事，多一個「你是被聊天室叫起的」只會多一條要維護的分支。
+**回報程式**（`src/report.mjs`）是這個設計的樞紐。Claude Code 每一段結束都呼叫它：
+
+| 階段 | 回報程式做的事 |
+|---|---|
+| `fiat` | 回報；`go` 記著的話，往 session 打 `go`，並把 `go` 消掉 |
+| `built` | 把 skill 裝進 OpenClaw、在房間上線（等同 `/fiat -install`），再回報 |
+| `done` | 更新 `.tap` 的 `timestamp`、回報，對照表那一筆標 `closing`（pid 留著） |
 
 幾個刻意的設計決定：
 
-- **一個房間屬於哪個專案，用一張表記，不靠掃描。** 曾經是掃 `.tap` 的：`.tap`
-  本來就是「這個專案在哪個房間上線」的記載，看起來不必再多一份設定。但同一個
-  房間先後開過兩個專案時，兩份 `.tap` 都還在，掃描就再也分不出要哪一個——而那
-  正是「重測一次」最常見的現場。所以改成一張表（`projectsFile`），**最後一次
-  指名的那個專案就是答案**。`.tap` 沒有因此變成裝飾品，它仍然是 skill 讀的那一份；
-  表只回答一個掃描答不了的問題。表裡沒有那一筆才退回掃描，掃到唯一一個就記進去。
-  表裡有、目錄卻不見了，就直接說不見了——把專案搬走或改名往往就是要讓它消失。
+- **機械動作放在每段必經的那支程式裡，不寫進 SKILL.md。** 部署、連續版的下一步、
+  推 `timestamp`——沒有一個需要判斷，而寫在 SKILL.md 裡拜託 AI 記得，
+  總有一次會忘。回報程式是 Claude Code 每一段結束都一定會經過的一道門，放在那裡就一定
+  會發生。它跟 plugin 共用 `src/core.js`，所以「房間怎麼認、script 怎麼找」只有一份實作。
 
-- **route 當不了這個索引。** 它指的是**部署出去的那支 script**，而要打開的是
-  **原始碼專案**，這兩個位置常常不同（`D:\workspaces\...` 對 `D:\projects\...`）。
+- **`go` 不管它正在做什麼都直接打。** 打進輸入框的純文字會在它那一輪中途就送進去
+  （斜線指令才會排到那一輪結束，實測過），它做完手上這一段，自然會接著做下去——
+  還在汲取就先把 FIAT 寫完、回報，再實作。所以不需要 `/tap -go` 這種斜線指令：
+  主述者、`/fiat -go`、回報程式打的是同一個 `go`，而且都是打完就走。
 
-- **不要求房間已經有 route。** 這一點跟 `/aside` 相反。`/tap <projname>` 的用途正是
-  替一個**還沒有 script 的房間**開專案；要求先有 route 等於要求先有 script，
-  那就永遠開不了第一個。所以 `/tap` 的開關是 `tap` 這段設定存不存在。
+- **但關 session 是 gateway 從外面關，不是 session 自己關。** 從裡面只能打 `/exit`，而 `/exit`
+  會停在「還有背景工作，確定要離開嗎」這種對話框——實際踩過，而且回報程式還先把 pid 清掉了，
+  第二次 `/fiat -done` 就找不到它。能在十秒後強制結束的 `ccrun -q` 又不能在裡面叫：它會等
+  session 結束，而 session 正在等它。所以回報程式只標 `closing`、pid 留著；`/fiat -done` 之後
+  gateway 在背景等那個標記，再 `ccrun -q`。gateway 中途重開過的話，再打一次 `/fiat -done`
+  就直接關。
 
-- **不等它跑完。** 一輪檢討動輒好幾分鐘，而 hook 卡住的就是那一則訊息的回覆。
-  所以先回一句「開始了」，跑完再用 `openclaw message send` 補一則結果——就是
-  AUTHORING.md 第 9 節給 script 用的那條路。代價是 gateway 中途重開的話那則結果
-  就沒了；trace log 裡還看得到。
+- **每一段重複呼叫都不會出事。** `go` 用過就消掉、裝過的照裝、`closing` 標過就是標過。
+  AI 偶爾會重試，重試不能變成「實作兩次」。
 
-- **同一個專案一次只跑一輪。** 兩個 harness 同時改同一份 script 只會互相蓋掉。
+- **一個房間一個專案，換綁定只有一條路**：`-uninstall` 再 `-install`。直接
+  `/fiat 別的專案` 太容易混淆，所以是錯誤。目錄已經存在、房間卻沒綁它的時候，
+  只有它自己的 `.tap` 本來就指著這個房間才算數。
 
-- **要不要接續 session，看登記不看猜。** `continueCommand` 只在對照表說「這個
-  專案跑過了」時才用。猜錯的代價很具體：第一輪就叫 harness 去接一個不存在的
-  session，整輪直接失敗。接續失敗時把記號清掉，下一輪自動退回乾淨的 session。
-  plugin 不假設 harness 的 CLI 長什麼樣子——那句 `--continue` 是操作者寫在設定裡的。
-  接續也不是無限的：harness 把 `viewed` 往前推的那一輪就是終點。推書籤＝這一段結案、
-  context 已經落到 repo 裡，再帶著舊 session 走下去只是讓它愈來愈胖。
+- **新專案看的是「目錄存不存在」，FIATLUX 還是 FIAT-{slug} 看的是「目錄裡有沒有程式」。**
+  前者是 plugin 的事（要不要建目錄），後者是 Claude Code 的事（寫哪一種文件）。
+  目錄存在、綁定有效、裡面卻空空的，仍然是「建立新專案」的那一種文件。
 
-- **上線是 plugin 做的，不是 harness 做的。** harness 只把 script 放到約定位置，
-  連一份設定檔都不寫；plugin 跑完才把「哪個房間、哪個專案」寫進設定，
-  而且先 `--dry-run` 驗過。這條界線讓「能改設定」這件事留在 plugin 手上——
-  AI 連提議的格式都碰不到，它能影響的只有「那個位置有沒有一支跑得起來的 script」。
-  跟裝好的完全一樣時就什麼都不做，回報也不會再喊一次。
+- **`-t` 只影響這一輪。** 它直接變成 `/tap` 的參數，不寫進 `.tap`；`timestamp` 只在
+  `done` 那一刻往前推。
+
+- **`/fiat` 不等 ccrun 回來。** ccrun 要等 session 真的能打字才回來，冷啟動常常超過半分鐘，
+  而指令卡住的是整個房間的回覆。所以先回話，失敗再補一則；等待期間同一個房間再打
+  `/fiat` 會被擋下來。
+
+- **一個房間一次一個 session。** 開著的時候再 `/fiat` 會被擋；pid 記著但已經不在了
+  （視窗被關掉、當機），就當沒有、重新叫一個。「還在不在」問 ccrun：它會順便確認那個 pid
+  還是 `claude.exe`。
+
+- **只帶跟任務有關的參數。** 工作目錄、Remote Control 的名字（ccrun 用目錄名）、
+  回報程式的位置。模型、effort、權限模式一概不帶，照使用者的 Claude Code 全域設定。
 
 - **專案名要通過 `/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/`。** 它來自不受信任的聊天輸入，
   而且會直接接在 `projectsDir` 後面當路徑用。開頭限定英數，所以不可能是 `.`、`..`
   或 `-rf`，中間不允許任何路徑分隔字元。
 
-- **已經存在的 `.tap` 不覆寫。** 裡面的 `viewed:` 是上一輪檢討的進度，蓋掉等於叫
-  下一輪從頭看起。唯一的例外是使用者自己打了起點日期——那是他明講的。
+- **一個專案就是一個 OpenClaw skill，安裝就是 `openclaw skills install`。** SKILL.md 教 AI
+  處理 script 放行的那些，`scripts/intercept.*` 攔確定性的那些。裝進去的是一份**複製**，
+  在這個房間的 agent 的 workspace 裡：AI 讀它的 SKILL.md、route 跑它的 script，開發目錄
+  怎麼改都不影響線上，直到再裝一次。沒被攔下的輸入怎麼交到那個 skill 手上是 OpenClaw 的事——
+  plugin 不替它注入任何提示詞，房間的 systemPrompt 也不必寫「載入某某 skill」。
+  skill 本身也不知道自己在哪個房間——它跟任何 skill 一樣，只描述自己做什麼、什麼時候用。
+  對照表記下 `installedDir`，route 只認它；沒有這一欄的舊登記一律不算數。
 
-- **`allowFrom` 是給不完全掌握的房間用的。** 這一行會在這台機器上叫起一個能改檔案的
-  agent，而房間裡的每個人都打得出來。省略代表「房間裡的人都可以」，那只適合自己的房間。
+- **`-uninstall` 會把裝上去的那一份拿掉**，否則它還會出現在這個 agent 的每一個房間。
+  只刪 `…/skills/<名字>` 這種位置；開發目錄一個檔案都不動。
+
+- **起點一定要帶 `-t`。** `/fiat 2026-09-28` 分不出是起點還是一個專案名。忘了帶的時候
+  回話直接給出補好的那一句，而不是一句「看不懂」。
+
+- **`-install` 會把專案的 `.tap` 改指到這個房間。** `/tap` 汲取的是 `.tap` 指的那個房間，
+  專案被裝到新房間，下一輪就該從新房間汲取。`timestamp` 留著。
+
+- **`allowFrom` 疊在 OpenClaw 自己的指令授權上。** `/fiat` 會在這台機器上叫起一個能改檔案的
+  agent；OpenClaw 認可的 sender 不一定都該有這個權力。
 
 ---
 
 ## 3. 邊界：plugin 到哪裡為止
 
-plugin 是通用的路由器，職責只有五件事：選 route、吃掉 `/aside`、接下 `/tap`、
-跑 script、依 exit code 決定短路還是放行。**領域邏輯與一切額外能力都在 script
-那一側；需要智力的判斷則在 `/tap` 叫起的 harness 那一側。**
+plugin 是通用的路由器，職責只有這幾件事：選 route、跑 script、依 exit code 決定
+短路還是放行、把 AI 沒看到的話記下來，以及 `/aside` 與 `/fiat` 兩個指令。
+**領域邏輯與一切額外能力都在 script 那一側；需要智力的判斷則在 `/fiat` 叫起的
+Claude Code 那一側。**
 
 script 需要更多能力時，OpenClaw CLI 本身就是它的介面，plugin 不必轉手：
 
@@ -433,8 +486,8 @@ script 需要更多能力時，OpenClaw CLI 本身就是它的介面，plugin �
 plugin 這一側不需要為它們新增任何欄位。
 
 真正屬於 plugin 的設定只有兩組，而且兩組都是路由問題：route 的
-`channel` + `target`（這個房間交給哪一支 script），以及 `tap` 的 `projectsDir`
-+ `command`（這個房間對應哪個專案目錄、用哪個 harness 打開它）。
+`channel` + `target`（這個房間交給哪一支 script），以及 `fiat` 的 `projectsDir`
++ `ccrun`（這個房間對應哪個專案目錄、用什麼叫起 Claude Code）。
 路由到「哪裡」是 plugin 的事，到了那裡之後做什麼都不是。
 
 ### 為什麼 stdout 只收純文字
@@ -454,17 +507,21 @@ script 直接呼叫就好，而且順便拿到多則訊息與 edit——那些�
 
 - **被攔截的訊息不會進 session 歷史。** 使用者後面問 AI「我剛剛做了什麼」，
   AI 不知道。這是省 token 的必然代價，DB 才是唯一真相。
-  事後要檢討那些輸入，用 `/tap`（2.8）從本機檔案還原。
-- **`handled: true` 但沒給 `reply`** → OpenClaw 回 `{ text: "NO_REPLY" }`，
-  這是內建的靜默 token，使用者端什麼都不會收到。要「處理掉但不回話」就用這個。
+  事後要檢討那些輸入，offstage log 裡都有，`/tap`（2.8）會把它跟 session 檔合起來還原。
+- **`handled: true` 但沒給 `text`** → 使用者端什麼都不會收到，也不會被補「沒有產生回覆」。
+  要「處理掉但不回話」就用這個。
 - **plugin config 不會 hot reload。** 改 `openclaw.json` 之後要
-  `openclaw gateway restart` 才算數，改 `src/index.js` 當然也要。
-  這一條是實測出來的，而且付過代價：`/tap -install` 曾經把 route 寫進
+  `openclaw gateway restart` 才算數。改 `src/` 則是 `openclaw plugins reload openclaw-chat-interceptor`（2026.9.6）。
+  這一條是實測出來的，而且付過代價：`-install` 曾經把 route 寫進
   `openclaw.json`，回話說「裝好了」，使用者下一句話卻還是走舊的 route——
   設定檔在 17:01 就改好了，17:02 的訊息用的還是啟動時載入的那份。
   **所以上線改成寫進 `projectsFile`**（每一則訊息都重讀，當場生效）；
   plugin 自己也不可能去重啟 gateway——那等於在回話中途把自己殺掉。
 
+- **`commands.handlers` 不是 OpenClaw 的設定。** 要把一個指令掛成 OpenClaw 的
+  slash command，唯一的路是 plugin 的 `api.registerCommand()`——`commands` 那一段的
+  schema 是 strict 的，沒有 `handlers` 這個鍵。
+
 ---
 
-AI model used: Claude Opus 5.0
+AI model used: Claude Opus 5.5
