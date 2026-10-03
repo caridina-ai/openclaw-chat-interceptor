@@ -219,7 +219,7 @@ sys.stdout.write(do_the_thing(m.group(1)))
 | `command` | **一律用絕對路徑。** gateway 是系統服務啟動的，PATH 跟使用者的 shell 不一樣，`node`、`uv`、`python` 都可能找不到 |
 | `cwd` | 你的 script 如果需要相對路徑，就要求設這個；**更好的做法是根本不依賴 cwd** |
 | `env` | 外部工具在哪裡用 env 傳，不要寫死在 script 裡。**但資料路徑要小心**，見下 |
-| `timeoutMs` | 預設 15000。你的 script 會慢（例如巢狀呼叫別的程式）就講明要調大 |
+| `timeoutMs` | 預設 60000。你的 script 會慢（例如巢狀呼叫別的程式）就講明要調大 |
 | `onError` | **有副作用就用 `handle`（預設）**；純查詢、無副作用才可以用 `passthrough` |
 
 ### route 的 `env` 只給你的 script，AI 看不到

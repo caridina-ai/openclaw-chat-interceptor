@@ -49,7 +49,7 @@ import {
 const PLUGIN_ID = "openclaw-chat-interceptor";
 const DEFAULT_LOG_FILE = join(homedir(), ".openclaw", "logs", "chat-interceptor.log");
 const DEFAULT_OFFSTAGE_LOG_FILE = join(homedir(), ".openclaw", "logs", "chat-interceptor-offstage.log");
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 /** Claude Code 每一段結束時呼叫的回報程式。/fiat 叫起 session 時把路徑交給它。 */
 const REPORT_PATH = fileURLToPath(new URL("./report.mjs", import.meta.url));

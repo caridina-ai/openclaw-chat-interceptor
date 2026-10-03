@@ -96,7 +96,7 @@ openclaw plugins install --link <path to this repo>
 | `channel` | | `telegram`、`discord`…；省略代表不限 channel |
 | `cwd` | | script 的工作目錄 |
 | `env` | | 額外環境變數，蓋在 gateway 自己的之上 |
-| `timeoutMs` | | 預設 15000 |
+| `timeoutMs` | | 預設 60000 |
 | `onError` | | `handle`（預設，回錯誤訊息）或 `passthrough`（交給 AI）。只有無副作用的 script 才適合 passthrough |
 
 ＊ `project` 與 `command` 給一個就好。

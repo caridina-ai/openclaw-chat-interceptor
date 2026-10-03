@@ -135,7 +135,7 @@
             "timeoutMs": {
               "type": "integer",
               "minimum": 1,
-              "description": "Kill the script after this long. Defaults to 15000."
+              "description": "Kill the script after this long. Defaults to 60000."
             },
             "onError": {
               "enum": [
