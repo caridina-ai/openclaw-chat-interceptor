@@ -137,12 +137,12 @@ openclaw-chat-interceptor/
 ├── openclaw.plugin.json        # plugin manifest：id / activation / configSchema
 ├── src/
 │   ├── index.js                # hook 與兩個 slash command（plain ESM，沒有 build step）
-│   ├── core.js                 # plugin 與回報程式共用：房間、對照表、.tap、script、ccrun
-│   └── report.mjs              # 回報程式：Claude Code 每一段結束時呼叫（見 2.9）
-├── test/*.test.js              # node --test，不需要 gateway、不需要 Claude Code
-├── skills/tap/                 # /tap：給 Claude Code 裝的技能（見 2.8）
+│   └── core.js                 # 機械部分：房間、對照表、.tap、script、ccrun／cdrun
+├── test/*.test.js              # node --test，不需要 gateway、Claude Code 或 Codex
+├── skills/tap/                 # /tap：給 Claude Code 或 Codex 裝的技能（見 2.8）
 │   ├── SKILL.md
-│   └── tap.mjs
+│   ├── tap.mjs                 # 汲取對話
+│   └── report.mjs              # 回報程式：每一段結束時呼叫（見 2.9）
 ├── genesis/                    # 本專案的委託書：FIATLUX.md 與後續的 FIAT-*.md
 └── docs/
     ├── AUTHORING.md            # 給 script 作者
@@ -153,8 +153,7 @@ openclaw-chat-interceptor/
 script 專案（見 AUTHORING.md）。測試用的是寫進暫存目錄的 fixture，
 所以跑測試不需要任何外部 script、DB 或 gateway。
 
-用 **plain JavaScript 而不是 TypeScript**：`--link` 安裝後改完檔案重啟 gateway
-就生效，中間沒有編譯。要發佈時再轉 TS + `runtimeExtensions` 也不遲。
+用 **plain JavaScript 而不是 TypeScript**：從 GitHub 裝下來就能跑，中間沒有編譯。
 
 `package.json` 刻意**不寫** `openclaw.compat`：本機版本是 `2026.7.1-2`，在 semver
 眼中是 `2026.7.1` 的 prerelease，寫 `minGatewayVersion: "2026.7.1"` 反而會判定不相容。
@@ -222,13 +221,12 @@ script 自己處理。
 ### 2.4 安裝與設定
 
 ```bash
-openclaw plugins install --link <path to this repo>
+openclaw plugins install git:github.com/caridina-ai/openclaw-chat-interceptor
 ```
 
-`--link` 不複製檔案，只在 `plugins.load.paths` 記一筆路徑：repo 就是線上版，
-改完 `openclaw plugins reload openclaw-chat-interceptor` 就生效。
+裝進去的是一份複製，更新用 `openclaw plugins update openclaw-chat-interceptor` 再重啟 gateway。
 
-然後 `~/.openclaw/openclaw.json`（完整範例見 README）：
+設定寫在 `~/.openclaw/openclaw.json` 的這一段（README 用 `openclaw config patch` 寫進去）：
 
 ```json
 "openclaw-chat-interceptor": {
@@ -334,7 +332,7 @@ append 一行 `<當地時間> {"kind":"aside", …}`。
 正好是看不到的那些。**
 
 `skills/tap/` 是一個 [Agent Skill](https://github.com/vercel-labs/skills)
-（`npx skills add`，裝進 Claude Code），`tap.mjs` 把五個本機來源合併還原：
+（`npx skills add`，裝進 Claude Code 或 Codex），`tap.mjs` 把五個本機來源合併還原：
 
 | # | 來源 | 給得出什麼 |
 |---|---|---|
@@ -359,17 +357,32 @@ message id**，不是 telegram 的 id。缺漏偵測若照著 id 範圍從頭數
 
 SKILL.md 分三段：`/tap [起點]` 汲取並寫 FIAT 文件、收到 `go` 實作、
 `/tap -done` commit 並寫交接 memory。每一段最後都呼叫回報程式。
-**SKILL.md 只寫 Claude Code 需要知道的事**——回報程式背後還會做什麼，它不需要知道。
+**SKILL.md 只寫寫程式的 AI 需要知道的事**——回報之後 gateway 還會做什麼，它不需要知道。
 
 ### 2.9 `/fiat`：在房間裡把軟體生出來
 
 `/fiat` 也是 `api.registerCommand()` 註冊的 slash command，**不在 hook 裡**：它叫起的
-Claude Code 只會收到固定的 `/tap [起點]`、`go`、`/tap -done`，完全不需要
-「先攔下來看看」那一套。
+AI 只會收到固定的 `/tap [起點]`、`go`、`/tap -done`，完全不需要「先攔下來看看」那一套。
+
+寫程式的 AI 有兩種：Claude Code（[ccrun](https://github.com/neritina-ai/cli-ccrun) 叫起）與
+Codex（[cdrun](https://github.com/caridina-ai/cli-cdrun) 叫起）。兩支程式的介面一模一樣——
+`-d <dir> [prompt]` 開並印出 pid、`-p <pid> <text>` 打字、`-p <pid> -s` 看、`-p <pid> -q` 關——
+所以 plugin 裡只有一張表（`core.js` 的 `HARNESSES`：名字與程式），**沒有哪一段程式是專為其中一種寫的**。
+相容性不夠的地方改 runner，不在 plugin 裡分支。
+
+`-claude`／`-codex` 指定這一輪叫哪一個，沒指定就用設定的 `fiat.harness`（再沒有就是 Claude Code）。
+叫起之後對照表記下 `harness`，之後的 `-go`、`-done`、`?`、關 session 都用同一支 runner。
 
 **`-go` 只有一個意思：這個房間的專案，接下來一路自動做到裝好。** 還沒開 session 就是連續版；
-已經開著（例如停在 FIAT 文件等人看），就注入 `go` 請它接著做。主述者在 Remote Control
-打 `go` 也一樣，但那條路壞了、或 FIAT 文件一時看不到時，房間裡的 `/fiat -go` 是唯一的路。
+已經開著（例如停在 FIAT 文件等人看），就注入 `go` 請它接著做。主述者也可以在手機上直接打 `go`
+（Claude Code 走 Remote Control，Codex 走 Codex app），但那條路壞了、或 FIAT 文件一時看不到時，
+房間裡的 `/fiat -go` 是唯一的路。
+
+**Codex 的對話一次只能有一個程式在寫。** cdrun 只在有事做的時候拿著它，閒下來就放手，主述者
+才能從手機（經由 Codex app）接上去討論；之後再注入的話，沒人拿著就由 cdrun 拿回來跑，Codex app
+拿著就排進 Codex 自己的佇列、由 Codex app 跑。所以一輪裡的後半段，可能是在 Codex app 裡跑的。
+收尾關 session 時，Claude Code 是結束行程，Codex 則是封存對話（`cdrun -q` 會做）。Codex app 正開著
+那段對話時封存不了：對話留在 app 裡，app 為它開的背景程式也還佔著專案目錄，直到在 app 裡關掉它。
 
 | 訊息 | plugin 做的事 |
 |---|---|
@@ -378,44 +391,52 @@ Claude Code 只會收到固定的 `/tap [起點]`、`go`、`/tap -done`，完全
 | `/fiat ?`（或 `？`） | 讀對照表、`.tap` 與設定裡的 route 回報狀況。不叫起、不改任何東西，也不列路徑——房間裡的人都看得到 |
 | `… -t yyyy-mm-dd HH:MM` | 注入的變成 `/tap yyyy-mm-dd HH:MM` |
 | `… -go` | 對照表那一筆記上 `go` |
+| `… -claude`／`-codex` | 這一輪用哪一個 |
 | `/fiat -go` | session 開著：注入 `go`。沒開：連續版（上一列） |
 | `/fiat -done` | 注入 `/tap -done` |
 | `/fiat -install [projname]` | `openclaw skills install` 把專案的 skill 裝進這個房間的 agent，對照表記下裝上去的那一份 |
 | `/fiat -uninstall` | 清掉對照表那一筆，拿掉裝上去的 skill |
 
-前兩列（加上沒開 session 時的 `-go`）合流之後做同一件事：`ccrun -d <專案目錄> "/tap [起點]"`，
-環境變數多帶兩個——`FIAT_REPORT`（回報程式的位置）與 `FIAT_CONTEXT`（房間、專案、
-agent、對照表、ccrun 與 openclaw CLI 的 argv）。ccrun 回傳的 pid 記進對照表，那就是之後 `-go`、`-done`
-與回報程式找到這個 session 的把手。
+前兩列（加上沒開 session 時的 `-go`）合流之後做同一件事：`<runner> -d <專案目錄> "/tap [起點]"`，
+其他什麼都不帶。runner 回傳的 pid 記進對照表，那就是之後 `-go`、`-done` 與關 session 的把手。
 
-**回報程式**（`src/report.mjs`）是這個設計的樞紐。Claude Code 每一段結束都呼叫它：
+**回報**是這個設計的樞紐。AI 每一段結束都在專案根目錄呼叫回報程式（跟 `tap.mjs` 放在一起的
+`skills/tap/report.mjs`），它把「哪個房間（專案的 `.tap`）、哪個專案目錄、哪一段、一段話」POST 到
+plugin 註冊的 HTTP 路由 `/chat-interceptor/report`，其餘的事都在 gateway 裡做：
 
-| 階段 | 回報程式做的事 |
+| 階段 | gateway 做的事 |
 |---|---|
 | `fiat` | 回報；`go` 記著的話，往 session 打 `go`，並把 `go` 消掉 |
 | `built` | 把 skill 裝進 OpenClaw、在房間上線（等同 `/fiat -install`），再回報 |
-| `done` | 更新 `.tap` 的 `timestamp`、回報，對照表那一筆標 `closing`（pid 留著） |
+| `done` | 更新 `.tap` 的 `timestamp`、回報，標 `closing`，等 session 把這一輪講完再從外面關掉 |
 
 幾個刻意的設計決定：
 
-- **機械動作放在每段必經的那支程式裡，不寫進 SKILL.md。** 部署、連續版的下一步、
-  推 `timestamp`——沒有一個需要判斷，而寫在 SKILL.md 裡拜託 AI 記得，
-  總有一次會忘。回報程式是 Claude Code 每一段結束都一定會經過的一道門，放在那裡就一定
-  會發生。它跟 plugin 共用 `src/core.js`，所以「房間怎麼認、script 怎麼找」只有一份實作。
+- **機械動作放在每段必經的那道門，不寫進 SKILL.md。** 部署、連續版的下一步、
+  推 `timestamp`——沒有一個需要判斷，而寫在 SKILL.md 裡拜託 AI 記得，總有一次會忘。
 
-- **`go` 不管它正在做什麼都直接打。** 打進輸入框的純文字會在它那一輪中途就送進去
-  （斜線指令才會排到那一輪結束，實測過），它做完手上這一段，自然會接著做下去——
+- **回報程式只送一個 HTTP 請求，事情全在 gateway 做。** Codex 開著 sandbox（`workspace-write`）的時候，
+  node 開不了任何子行程、也寫不了專案以外的檔案，`openclaw` CLI、runner、對照表全碰不到；連回本機 gateway
+  倒是可以。gateway 這一側什麼都碰得到，而且 runner 的把手本來就在它手上。
+
+- **回報程式不靠環境變數。** 被主述者從手機接手之後，Codex 的對話是在 Codex app 裡接著跑的，那裡沒有
+  /fiat 叫起時的環境。所以房間從專案的 `.tap` 認，gateway 的 port 照 OpenClaw 自己的順序找
+  （`OPENCLAW_GATEWAY_PORT`、設定檔的 `gateway.port`、18789）。gateway 只認「房間綁的就是這個專案目錄、
+  而且有一個開著的 session」的回報；房間被 `-uninstall`、換了專案、session 已經關了，就什麼都不做。
+  路由用 `auth: "plugin"`，只收 JSON 而且不帶 `Origin` 的請求——網頁跨站送不出這種請求。
+  gateway 重啟期間連不上，回報程式會等它回來。
+
+- **`go` 不管它正在做什麼都直接打。** 它做完手上這一段，自然會接著做下去——
   還在汲取就先把 FIAT 寫完、回報，再實作。所以不需要 `/tap -go` 這種斜線指令：
-  主述者、`/fiat -go`、回報程式打的是同一個 `go`，而且都是打完就走。
+  主述者、`/fiat -go`、回報打的是同一個 `go`，而且都是打完就走。
 
-- **但關 session 是 gateway 從外面關，不是 session 自己關。** 從裡面只能打 `/exit`，而 `/exit`
-  會停在「還有背景工作，確定要離開嗎」這種對話框——實際踩過，而且回報程式還先把 pid 清掉了，
-  第二次 `/fiat -done` 就找不到它。能在十秒後強制結束的 `ccrun -q` 又不能在裡面叫：它會等
-  session 結束，而 session 正在等它。所以回報程式只標 `closing`、pid 留著；`/fiat -done` 之後
-  gateway 在背景等那個標記，再 `ccrun -q`。gateway 中途重開過的話，再打一次 `/fiat -done`
-  就直接關。
+- **關 session 是 gateway 從外面關，不是 session 自己關。** 從裡面只能打 `/exit`，而 `/exit`
+  會停在「還有背景工作，確定要離開嗎」這種對話框。`-q` 能在十秒後強制結束，但它會等 session
+  結束，所以只能從外面叫。收到 `done` 時 session 還在把這一輪講完（回報就是它這一輪叫的），
+  所以先等一會兒再 `-q`。gateway 在那之間重開過的話，對照表停在 `closing`，再打一次
+  `/fiat -done` 就直接關。
 
-- **每一段重複呼叫都不會出事。** `go` 用過就消掉、裝過的照裝、`closing` 標過就是標過。
+- **每一段重複回報都不會出事。** `go` 用過就消掉、裝過的照裝、關 session 只排一次。
   AI 偶爾會重試，重試不能變成「實作兩次」。
 
 - **一個房間一個專案，換綁定只有一條路**：`-uninstall` 再 `-install`。直接
@@ -423,22 +444,21 @@ agent、對照表、ccrun 與 openclaw CLI 的 argv）。ccrun 回傳的 pid 記
   只有它自己的 `.tap` 本來就指著這個房間才算數。
 
 - **新專案看的是「目錄存不存在」，FIATLUX 還是 FIAT-{slug} 看的是「目錄裡有沒有程式」。**
-  前者是 plugin 的事（要不要建目錄），後者是 Claude Code 的事（寫哪一種文件）。
+  前者是 plugin 的事（要不要建目錄），後者是 AI 的事（寫哪一種文件）。
   目錄存在、綁定有效、裡面卻空空的，仍然是「建立新專案」的那一種文件。
 
 - **`-t` 只影響這一輪。** 它直接變成 `/tap` 的參數，不寫進 `.tap`；`timestamp` 只在
   `done` 那一刻往前推。
 
-- **`/fiat` 不等 ccrun 回來。** ccrun 要等 session 真的能打字才回來，冷啟動常常超過半分鐘，
+- **`/fiat` 不等 runner 回來。** runner 要等 session 真的能接話才回來，冷啟動常常超過半分鐘，
   而指令卡住的是整個房間的回覆。所以先回話，失敗再補一則；等待期間同一個房間再打
   `/fiat` 會被擋下來。
 
 - **一個房間一次一個 session。** 開著的時候再 `/fiat` 會被擋；pid 記著但已經不在了
-  （視窗被關掉、當機），就當沒有、重新叫一個。「還在不在」問 ccrun：它會順便確認那個 pid
-  還是 `claude.exe`。
+  （視窗被關掉、當機），就當沒有、重新叫一個。「還在不在」問叫起它的那支 runner。
 
-- **只帶跟任務有關的參數。** 工作目錄、Remote Control 的名字（ccrun 用目錄名）、
-  回報程式的位置。模型、effort、權限模式一概不帶，照使用者的 Claude Code 全域設定。
+- **只帶跟任務有關的參數。** 工作目錄與第一句話。模型、effort、
+  權限模式一概不帶，照使用者自己的 Claude Code／Codex 設定。
 
 - **專案名要通過 `/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/`。** 它來自不受信任的聊天輸入，
   而且會直接接在 `projectsDir` 後面當路徑用。開頭限定英數，所以不可能是 `.`、`..`
@@ -464,6 +484,10 @@ agent、對照表、ccrun 與 openclaw CLI 的 argv）。ccrun 回傳的 pid 記
 - **`allowFrom` 疊在 OpenClaw 自己的指令授權上。** `/fiat` 會在這台機器上叫起一個能改檔案的
   agent；OpenClaw 認可的 sender 不一定都該有這個權力。
 
+- **Discord 的斜線指令，`ctx.to` 是 `slash:<使用者 id>`**（回覆給按指令的那個人），
+  不是頻道。房間改從 sessionKey 或 `from`（`discord:channel:<id>`）認，否則 `/fiat`
+  會把「這個人」當成房間。
+
 ---
 
 ## 3. 邊界：plugin 到哪裡為止
@@ -471,7 +495,7 @@ agent、對照表、ccrun 與 openclaw CLI 的 argv）。ccrun 回傳的 pid 記
 plugin 是通用的路由器，職責只有這幾件事：選 route、跑 script、依 exit code 決定
 短路還是放行、把 AI 沒看到的話記下來，以及 `/aside` 與 `/fiat` 兩個指令。
 **領域邏輯與一切額外能力都在 script 那一側；需要智力的判斷則在 `/fiat` 叫起的
-Claude Code 那一側。**
+AI（Claude Code 或 Codex）那一側。**
 
 script 需要更多能力時，OpenClaw CLI 本身就是它的介面，plugin 不必轉手：
 
@@ -482,12 +506,12 @@ script 需要更多能力時，OpenClaw CLI 本身就是它的介面，plugin �
 | 來回兩輪的流程狀態 | 用 stdin 給的 `sessionKey` 當 key 自己寫狀態檔 |
 | 同一個房間內依關鍵字分流 | 一支 script，內部自己 dispatch |
 
-這幾條都寫在 [AUTHORING.md](AUTHORING.md) 第 8、9 節，給 script 作者看。
+這幾條都寫在 [AUTHORING.md](AUTHORING.md) 第 6、7 節，給 script 作者看。
 plugin 這一側不需要為它們新增任何欄位。
 
 真正屬於 plugin 的設定只有兩組，而且兩組都是路由問題：route 的
 `channel` + `target`（這個房間交給哪一支 script），以及 `fiat` 的 `projectsDir`
-+ `ccrun`（這個房間對應哪個專案目錄、用什麼叫起 Claude Code）。
++ `ccrun`／`cdrun`（這個房間對應哪個專案目錄、用什麼叫起寫程式的 AI）。
 路由到「哪裡」是 plugin 的事，到了那裡之後做什麼都不是。
 
 ### 為什麼 stdout 只收純文字
@@ -511,7 +535,7 @@ script 直接呼叫就好，而且順便拿到多則訊息與 edit——那些�
 - **`handled: true` 但沒給 `text`** → 使用者端什麼都不會收到，也不會被補「沒有產生回覆」。
   要「處理掉但不回話」就用這個。
 - **plugin config 不會 hot reload。** 改 `openclaw.json` 之後要
-  `openclaw gateway restart` 才算數。改 `src/` 則是 `openclaw plugins reload openclaw-chat-interceptor`（2026.9.6）。
+  `openclaw gateway restart` 才算數。
   這一條是實測出來的，而且付過代價：`-install` 曾經把 route 寫進
   `openclaw.json`，回話說「裝好了」，使用者下一句話卻還是走舊的 route——
   設定檔在 17:01 就改好了，17:02 的訊息用的還是啟動時載入的那份。

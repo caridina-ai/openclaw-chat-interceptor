@@ -13,18 +13,20 @@
 //      「放行給 AI」。AI 沒看到的那些，一律記進 offstage log。斜線指令不送 script。
 //   2. `/aside`：OpenClaw 的 slash command。留一句話，AI 與 script 都收不到，
 //      只記進 offstage log。
-//   3. `/fiat`：OpenClaw 的 slash command。用 ccrun 叫起 Claude Code，請它施展
-//      /tap 技能，把房間裡聊出來的東西做成軟體。
-// 所有領域邏輯都在 script 裡，所有需要智力的判斷都在 Claude Code 裡。
+//   3. `/fiat`：OpenClaw 的 slash command。用 ccrun 叫起 Claude Code、或用 cdrun 叫起
+//      Codex，請它施展 /tap 技能，把房間裡聊出來的東西做成軟體。它每一段結束時的回報，
+//      從 gateway 的 HTTP 路由回到這裡。
+// 所有領域邏輯都在 script 裡，所有需要智力的判斷都在寫程式的 AI 那裡。
 
 import { execFile } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, dirname, join, resolve } from "node:path";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import {
+  DEFAULT_HARNESS,
   DEFAULT_PROJECTS_FILE,
+  HARNESSES,
   deriveRoute,
   inject,
   installSkill,
@@ -40,6 +42,7 @@ import {
   readTap,
   removeInstalledSkill,
   roomKey,
+  roomOf,
   sessionAlive,
   skillDirOf,
   tapFileOf,
@@ -50,9 +53,8 @@ const PLUGIN_ID = "openclaw-chat-interceptor";
 const DEFAULT_LOG_FILE = join(homedir(), ".openclaw", "logs", "chat-interceptor.log");
 const DEFAULT_OFFSTAGE_LOG_FILE = join(homedir(), ".openclaw", "logs", "chat-interceptor-offstage.log");
 const DEFAULT_TIMEOUT_MS = 60_000;
-
-/** Claude Code 每一段結束時呼叫的回報程式。/fiat 叫起 session 時把路徑交給它。 */
-const REPORT_PATH = fileURLToPath(new URL("./report.mjs", import.meta.url));
+/** /tap 的回報程式（skills/tap/report.mjs）把每一段交回 gateway 的路由。 */
+const REPORT_ROUTE = "/chat-interceptor/report";
 
 /** script 用這個 exit code 說「這句我不會，請交給 AI」。 */
 const EXIT_PASS = 20;
@@ -69,7 +71,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^\d{2}:\d{2}(:\d{2})?$/;
 
 const FIAT_USAGE =
-  "Use /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go], /fiat ?, /fiat -install [projname], /fiat -uninstall or /fiat -done.";
+  "Use /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go] [-claude|-codex], /fiat ?, /fiat -install [projname], /fiat -uninstall or /fiat -done.";
 
 /**
  * debug 為 true 時把每一輪的判斷寫進 logFile。
@@ -365,12 +367,18 @@ const commandConfigOf = (api, ctx) => ctx?.config?.plugins?.entries?.[PLUGIN_ID]
 /**
  * 指令是從哪個房間打的。算法要跟 hook 對得上，對照表的 key 才會是同一個。
  * `ctx.to` 是 `telegram:-100…` 這種帶 provider 的寫法，正規化之後就是 hook 看到的裸 id。
+ * Discord 的斜線指令例外：`to` 是 `slash:<使用者 id>`（回覆給按指令的那個人），
+ * 頻道要從 sessionKey 或 `from`（`discord:channel:<id>`）拿。
  */
 function commandRoom(ctx) {
   const channel = lower(ctx?.channel);
-  const raw = ctx?.to || targetFromSessionKey(ctx?.sessionKey) || ctx?.from || "";
+  const to = isSlashInteraction(ctx) ? "" : ctx?.to;
+  const raw = to || targetFromSessionKey(ctx?.sessionKey) || ctx?.from || "";
   return { channel, target: normalizeTarget(raw, channel) };
 }
+
+/** Discord 的斜線指令：`to` 是按指令的那個人，不是頻道。 */
+const isSlashInteraction = (ctx) => /^slash:/i.test(ctx?.to ?? "");
 
 // ---------------------------------------------------------------------------
 // `/aside`
@@ -398,30 +406,56 @@ function aside(api, ctx) {
 // ---------------------------------------------------------------------------
 // 在房間裡聊著聊著，軟體就生出來了：
 //
-//   /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go]   叫起 Claude Code，注入 `/tap [起點]`
+//   /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go] [-claude|-codex]   叫起寫程式的 AI，注入 `/tap [起點]`
 //   /fiat ?                                        只查不做：這個房間綁了什麼、裝了什麼、session 開著沒有
 //   /fiat -install [projname]                      把專案的 skill 裝進 OpenClaw，並在這個房間上線
 //   /fiat -uninstall                               下線、拿掉裝上去的 skill，解除綁定
 //   /fiat -done                                    驗收過了：請它 commit、寫交接 memory
 //
+// 寫程式的 AI 是 Claude Code（ccrun 叫起）或 Codex（cdrun 叫起）。兩支程式介面一樣，
+// 所以這裡只有一張表（core.js 的 HARNESSES），沒有哪一段是專為其中一種寫的。
+// `-claude`／`-codex` 指定這一輪用哪一個，沒指定就用設定的 `fiat.harness`。
+//
 // `-go` 只有一個意思：這個房間的專案，接下來一路自動做到裝好。還沒開 session 就叫起
-// 連續版（FIAT 文件寫好由回報程式注入 `go`）；已經開著——例如停在 FIAT 文件等人看——
-// 就注入 `go` 請它接著做。主述者在 Remote Control 打 `go` 也一樣，但那條路壞了、
-// 或 FIAT 文件一時看不到的時候，房間裡的 `/fiat -go` 是唯一讓它繼續的辦法。
+// 連續版（FIAT 文件寫好就替它注入 `go`）；已經開著——例如停在 FIAT 文件等人看——
+// 就注入 `go` 請它接著做。
 //
 // 起點一定要帶 `-t`：`/fiat 2026-09-28` 沒有它，就分不出是起點還是一個叫 2026-09-28 的專案。
 // 忘了帶的時候（常常會），回話直接給出補好的那一句。
 //
-// Claude Code 那一側只會收到固定的 `/tap [起點]`、`go`、`/tap -done`，
-// 其餘的說明都寫在 /tap 的 SKILL.md。它每一段結束會呼叫回報程式（report.mjs），
-// 安裝、連續版的下一步、更新 timestamp、關掉 session 都在那裡。
+// 那一側只會收到固定的 `/tap [起點]`、`go`、`/tap -done`，其餘的說明都寫在 /tap 的 SKILL.md。
+// 它每一段結束會呼叫回報程式（report.mjs），回報程式把那一段交回這裡（receiveReport）：
+// 回報到房間、連續版的下一步、安裝、更新 timestamp、關掉 session，都在 gateway 這一側做。
 
-/** 叫起中的房間。ccrun 要等 session 真的能打字才回來，那段時間裡不能再叫一次。 */
-const starting = new Set();
+/** 叫起中的房間 → 叫起的是哪一種。runner 要等 session 真的能接話才回來，那段時間裡不能再叫一次。 */
+const starting = new Map();
+
+/** 這個房間的 session 已經沒了（或從沒有過）：對照表裡跟它有關的欄位一起清掉。 */
+const NO_SESSION = { harness: undefined, pid: undefined, go: undefined, closing: undefined };
+
+const isHarness = (key) => typeof key === "string" && Object.hasOwn(HARNESSES, key);
+
+/** 開著的 session 是哪一種；沒開著就是下一輪會叫的那一種（設定的預設）。 */
+const sessionHarness = (settings, entry) => (entry?.pid && isHarness(entry.harness) ? entry.harness : settings.harness);
+const sessionLabel = (settings, entry) => HARNESSES[sessionHarness(settings, entry)].label;
+const sessionRunner = (settings, entry) => settings.runners[sessionHarness(settings, entry)];
+
+/** 外部程式的 argv 與預設的 harness：指令與回報路由共用的設定。 */
+function fiatSettings(fiatConfig) {
+  const argv = (value, fallback) => (Array.isArray(value) && value.length ? value.map(String) : [fallback]);
+  return {
+    projectsDir: String(fiatConfig.projectsDir ?? "").trim(),
+    projectsFile: fiatConfig.projectsFile || DEFAULT_PROJECTS_FILE,
+    harness: isHarness(fiatConfig.harness) ? fiatConfig.harness : DEFAULT_HARNESS,
+    runners: Object.fromEntries(Object.entries(HARNESSES).map(([key, { runner }]) => [key, argv(fiatConfig[runner], runner)])),
+    openclaw: fiatConfig.openclaw,
+    interpreters: fiatConfig.interpreters,
+  };
+}
 
 function parseFiat(args) {
   const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
-  const parsed = { name: null, since: null, go: false, verb: null };
+  const parsed = { name: null, since: null, go: false, harness: null, verb: null };
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
     if (DATE_RE.test(token)) {
@@ -446,16 +480,19 @@ function parseFiat(args) {
       i += parsed.since === date ? 1 : 2;
     } else if (flag === "go") {
       parsed.go = true;
+    } else if (isHarness(flag)) {
+      if (parsed.harness && parsed.harness !== flag) return { error: `-${parsed.harness} and -${flag} do not go together.` };
+      parsed.harness = flag;
     } else if ((flag === "install" || flag === "uninstall" || flag === "done") && !parsed.verb) {
       parsed.verb = flag;
     } else {
       return { error: `unknown option "${token}". ${FIAT_USAGE}` };
     }
   }
-  const { name, since, go, verb } = parsed;
-  if (verb === "install" && (since || go)) return { error: "-install takes nothing but a project name." };
-  if ((verb === "uninstall" || verb === "done") && (name || since || go)) return { error: `-${verb} takes no arguments.` };
-  if (verb === "status" && (name || since || go)) return { error: "? takes no arguments." };
+  const { name, since, go, harness, verb } = parsed;
+  if (verb === "install" && (since || go || harness)) return { error: "-install takes nothing but a project name." };
+  if ((verb === "uninstall" || verb === "done") && (name || since || go || harness)) return { error: `-${verb} takes no arguments.` };
+  if (verb === "status" && (name || since || go || harness)) return { error: "? takes no arguments." };
   if (name && !PROJECT_RE.test(name)) {
     return { error: `"${name}" is not a usable project name (one path segment: letters, digits, dot, dash, underscore).` };
   }
@@ -487,8 +524,8 @@ async function fiat(api, ctx) {
   if (allowFrom && !allowFrom.includes(String(ctx?.senderId ?? ""))) {
     return { text: "fiat: this account is not allowed to run fiat here." };
   }
-  const projectsDir = String(fiatConfig.projectsDir ?? "").trim();
-  if (!projectsDir) return { text: "fiat: set fiat.projectsDir in the plugin config first." };
+  const base = fiatSettings(fiatConfig);
+  if (!base.projectsDir) return { text: "fiat: set fiat.projectsDir in the plugin config first." };
   const room = commandRoom(ctx);
   if (!room.channel || !room.target) return { text: "fiat: cannot tell which room this is." };
 
@@ -496,42 +533,34 @@ async function fiat(api, ctx) {
   if (parsed.error) return { text: `fiat: ${parsed.error}` };
 
   const key = roomKey(room);
-  const entry = readIndex(fiatConfig.projectsFile || DEFAULT_PROJECTS_FILE)[key] ?? null;
-  const settings = {
-    projectsDir,
-    projectsFile: fiatConfig.projectsFile || DEFAULT_PROJECTS_FILE,
-    ccrun: fiatConfig.ccrun,
-    openclaw: fiatConfig.openclaw,
-    interpreters: fiatConfig.interpreters,
-    // skill 裝進這個房間的 agent 的 workspace。房間沒有另外綁 agent 時，OpenClaw 給的是預設的那個。
-    agent: ctx?.agentId || entry?.agent || undefined,
-  };
+  const entry = readIndex(base.projectsFile)[key] ?? null;
+  // skill 裝進這個房間的 agent 的 workspace。房間沒有另外綁 agent 時，OpenClaw 給的是預設的那個。
+  const settings = { ...base, agent: ctx?.agentId || entry?.agent || undefined };
   if (parsed.verb === "status") return { text: await status(config, settings, room, key, entry) };
-  if (starting.has(key)) return { text: `fiat: Claude Code for ${entry?.name ?? "this room"} is still starting.` };
+  if (starting.has(key)) return { text: `fiat: ${starting.get(key)} for ${entry?.name ?? "this room"} is still starting.` };
 
   if (parsed.verb === "uninstall") return { text: await uninstall(config, settings, room, key, entry) };
   if (parsed.verb === "install") return { text: await install(settings, room, key, entry, parsed.name) };
 
-  const open = entry?.pid && (await sessionAlive(settings.ccrun, entry.pid)) ? entry.pid : null;
+  const open = entry?.pid && (await sessionAlive(sessionRunner(settings, entry), entry.pid)) ? entry.pid : null;
+  const label = sessionLabel(settings, entry);
   if (parsed.verb === "done") {
     if (!open) {
-      if (entry?.pid) patchRoom(settings.projectsFile, key, { pid: undefined, closing: undefined });
-      return { text: `fiat: no Claude Code session is open for ${entry?.name ?? "this room"}.` };
+      if (entry?.pid) patchRoom(settings.projectsFile, key, NO_SESSION);
+      return { text: `fiat: no ${label} session is open for ${entry?.name ?? "this room"}.` };
     }
-    // 回報程式已經標了「可以關了」卻還開著（gateway 在那之間重啟過、或上一次沒關成）：直接關。
-    if (entry.closing) return { text: await close(settings, room, key, entry) };
-    const text = await ask(settings, entry, "/tap -done", "commit and wrap up. It reports here when it is done.");
-    closeWhenDone(settings, room, key, entry);
-    return { text };
+    // 回報程式已經說做完了卻還開著（gateway 在那之間重啟過、或上一次沒關成）：直接關。
+    if (entry.closing) return { text: await close(settings, key, entry) };
+    return { text: await ask(settings, entry, "/tap -done", "commit and wrap up. It reports here when it is done.") };
   }
-  if (open && parsed.go && !parsed.since && (!parsed.name || parsed.name === entry.name)) {
+  const sameRound =
+    (!parsed.name || parsed.name === entry?.name) && (!parsed.harness || parsed.harness === sessionHarness(settings, entry));
+  if (open && parsed.go && !parsed.since && sameRound) {
     // 不管它正在做什麼都直接打：它做完手上這一段（還在汲取就先把 FIAT 寫完），自然會接著做。
     return { text: await ask(settings, entry, "go", "go on and implement the FIAT. It reports here when it is built.") };
   }
   if (open) {
-    return {
-      text: `fiat: Claude Code is already open for ${entry.name} (pid ${open}). /fiat -go (or go in Claude Code) to implement, /fiat -done to finish.`,
-    };
+    return { text: `fiat: ${label} is already open for ${entry.name} (pid ${open}). /fiat -go to implement, /fiat -done to finish.` };
   }
   return { text: startRound(settings, room, key, entry, parsed) };
 }
@@ -544,9 +573,9 @@ async function status(config, settings, room, key, entry) {
   const lines = [`project: ${entry?.name ?? "none"}`];
   if (entry) {
     lines.push(`installed: ${entry.installed ? (entry.skill ?? entry.name) : "no"}`);
-    const alive = entry.pid && (await sessionAlive(settings.ccrun, entry.pid));
+    const alive = entry.pid && (await sessionAlive(sessionRunner(settings, entry), entry.pid));
     const session = starting.has(key) ? "starting" : alive ? `pid ${entry.pid}${entry.closing ? ", closing" : ""}` : "not running";
-    lines.push(`Claude Code: ${session}`);
+    lines.push(`${starting.get(key) ?? sessionLabel(settings, alive ? entry : null)}: ${session}`);
     const tapFile = existsSync(entry.dir) ? tapFileOf(entry.dir) : null;
     lines.push(`timestamp: ${(tapFile && readTap(tapFile).timestamp) || "none"}`);
   }
@@ -567,58 +596,48 @@ function routeSkillName(route) {
 
 /**
  * 關 session 是 gateway 的事：它叫起的，把手在它這裡，而且它在 session 外面。
- * `ccrun -q` 打 `/exit`，十秒內沒走就直接結束——卡在確認對話框的 session 也關得掉。
+ * `-q` 請它結束，十秒內沒走就直接結束——卡在確認對話框的 session 也關得掉。
  */
-async function close(settings, room, key, entry) {
-  const result = await quit(settings.ccrun, entry.pid);
-  patchRoom(settings.projectsFile, key, { pid: undefined, closing: undefined });
-  if (result.ok) return `fiat: Claude Code for ${entry.name} is closed.`;
-  return `fiat: could not close Claude Code for ${entry.name} (pid ${entry.pid}): ${result.failure}`;
+async function close(settings, key, entry) {
+  const label = sessionLabel(settings, entry);
+  const result = await quit(sessionRunner(settings, entry), entry.pid);
+  patchRoom(settings.projectsFile, key, NO_SESSION);
+  if (result.ok) return `fiat: ${label} for ${entry.name} is closed.`;
+  return `fiat: could not close ${label} for ${entry.name} (pid ${entry.pid}): ${result.failure}`;
 }
 
-/** 正在等回報程式標 closing 的房間：同一個房間只要一個人在等。 */
+/** 已經排好要關的 session：同一個只排一次。 */
 const closers = new Set();
 
 /**
- * `/fiat -done` 之後在背景等：回報程式在 session 裡標了 `closing`，就從外面把它關掉。
- * 標完之後 session 通常還在把這一輪講完，所以先讓它講一會兒；`ccrun -q` 的十秒寬限之後
- * 還沒結束，就是被強制結束——它該存的 commit、memory、timestamp 在回報之前都存好了。
+ * 回報 done 之後關掉 session。這時它通常還在把這一輪講完（回報程式就是它這一輪叫的），
+ * 所以先讓它講一會兒；`-q` 的十秒寬限之後還沒結束，就是被強制結束——該存的 commit、
+ * memory、timestamp 在回報之前都存好了。gateway 在這之間重啟的話，`/fiat -done` 會直接關。
  */
-function closeWhenDone(settings, room, key, entry) {
+function closeSoon(settings, key, entry) {
   const closer = `${settings.projectsFile}|${key}|${entry.pid}`;
   if (closers.has(closer)) return;
   closers.add(closer);
-  const poll = Number(process.env.FIAT_CLOSE_POLL_MS ?? 5_000);
   const grace = Number(process.env.FIAT_CLOSE_GRACE_MS ?? 20_000);
-  const deadline = Date.now() + 2 * 60 * 60_000;
-  // 等待本身不該讓任何行程為它活著。
-  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref());
-  (async () => {
-    try {
-      while (Date.now() < deadline) {
-        await wait(poll);
-        const now = readIndex(settings.projectsFile)[key];
-        if (!now || now.pid !== entry.pid) return; // 換人了，或已經被關掉
-        if (!now.closing) continue;
-        await wait(grace);
-        const text = await close(settings, room, key, now);
-        if (!/is closed\.$/.test(text)) await notify(settings.openclaw, room, text);
-        return;
-      }
-    } finally {
-      closers.delete(closer);
-    }
-  })();
+  setTimeout(async () => {
+    closers.delete(closer);
+    const now = readIndex(settings.projectsFile)[key];
+    if (!now?.closing || now.pid !== entry.pid) return; // 換人了，或已經被關掉
+    const text = await close(settings, key, now);
+    if (!/is closed\.$/.test(text)) await notify(settings.openclaw, roomOf(key), text);
+  }, grace).unref();
 }
 
 async function ask(settings, entry, prompt, what) {
-  const sent = await inject(settings.ccrun, entry.pid, prompt);
-  if (!sent.ok) return `fiat: could not reach Claude Code (pid ${entry.pid}): ${sent.failure}`;
-  return `fiat: asked Claude Code to ${what}`;
+  const label = sessionLabel(settings, entry);
+  const sent = await inject(sessionRunner(settings, entry), entry.pid, prompt);
+  if (!sent.ok) return `fiat: could not reach ${label} (pid ${entry.pid}): ${sent.failure}`;
+  return `fiat: asked ${label} to ${what}`;
 }
 
-/** `/fiat [projname] [-t …] [-go]`：決定是哪個專案，然後叫起 Claude Code。 */
-function startRound(settings, room, key, entry, { name, since, go }) {
+/** `/fiat [projname] [-t …] [-go] [-claude|-codex]`：決定是哪個專案，然後叫起寫程式的 AI。 */
+function startRound(settings, room, key, entry, { name, since, go, harness }) {
+  harness ??= settings.harness;
   let project;
   let created = false;
   if (name) {
@@ -654,44 +673,31 @@ function startRound(settings, room, key, entry, { name, since, go }) {
       name: project.name,
       dir: project.dir,
       agent: settings.agent,
-      pid: undefined,
+      ...NO_SESSION,
+      harness,
       go: go || undefined,
-      closing: undefined,
     });
   } catch (error) {
     return `fiat: could not prepare ${project.name}: ${String(error?.message || error)}`;
   }
 
+  const { label } = HARNESSES[harness];
   const prompt = since ? `/tap ${since}` : "/tap";
-  const env = {
-    ...process.env,
-    FIAT_REPORT: REPORT_PATH,
-    FIAT_CONTEXT: JSON.stringify({
-      room: key,
-      name: project.name,
-      dir: project.dir,
-      agent: settings.agent,
-      projectsFile: settings.projectsFile,
-      ccrun: settings.ccrun,
-      openclaw: settings.openclaw,
-      interpreters: settings.interpreters,
-    }),
-  };
-  // 不等它：ccrun 要等 session 真的能打字才回來，冷啟動常常超過半分鐘，
+  // 不等它：runner 要等 session 真的能接話才回來，冷啟動常常超過半分鐘，
   // 而這段時間裡卡住的是整個房間的回覆。先回話，出事再補一則。
-  starting.add(key);
-  launch(settings.ccrun, project.dir, prompt, env).then(async (started) => {
+  starting.set(key, label);
+  launch(settings.runners[harness], project.dir, prompt).then(async (started) => {
     starting.delete(key);
     if (started.pid && readIndex(settings.projectsFile)[key]?.name === project.name) {
       patchRoom(settings.projectsFile, key, { pid: started.pid });
       return;
     }
-    if (started.error) await notify(settings.openclaw, room, `fiat: could not start Claude Code for ${project.name}: ${started.error}`);
+    if (started.error) await notify(settings.openclaw, room, `fiat: could not start ${label} for ${project.name}: ${started.error}`);
   });
 
   const notes = [created ? "new project" : null, since ? `from ${since}` : null, go ? "-go" : null].filter(Boolean);
   const then = go ? "It reports here as it goes, and installs the result when it is built." : "It reports here when the FIAT is ready.";
-  return `fiat: starting Claude Code for ${project.name}${notes.length ? ` (${notes.join(", ")})` : ""}: ${prompt}. ${then}`;
+  return `fiat: starting ${label} for ${project.name}${notes.length ? ` (${notes.join(", ")})` : ""}: ${prompt}. ${then}`;
 }
 
 /**
@@ -752,19 +758,144 @@ async function uninstall(config, settings, room, key, entry) {
     .filter((route) => boundTo(route, room))
     .map((route) => routeLabel(route) ?? "(unnamed)");
   if (!entry && !handWritten.length) return "fiat: this room has no project and no route.";
-  const open = entry?.pid && (await sessionAlive(settings.ccrun, entry.pid)) ? entry.pid : null;
+  const open = entry?.pid && (await sessionAlive(sessionRunner(settings, entry), entry.pid)) ? entry.pid : null;
   return [
     entry ? `fiat: this room no longer belongs to ${entry.name}.` : "fiat: this room had no project.",
     removed ? `The ${entry.skill ?? entry.name} skill was removed from OpenClaw (${entry.installedDir}).` : null,
     entry?.installedDir && !removed ? `Remove ${entry.installedDir} yourself.` : null,
     entry ? "Its project files are untouched." : null,
-    open ? `Its Claude Code session (pid ${open}) is still open.` : null,
+    open ? `Its ${sessionLabel(settings, entry)} session (pid ${open}) is still open.` : null,
     handWritten.length
       ? `Careful: openclaw.json still has a route for this room (${handWritten.join(", ")}). Remove it yourself and restart the gateway.`
       : null,
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// 回報：report.mjs 從 session 裡把每一段交回來
+// ---------------------------------------------------------------------------
+// session 裡能做的事有限：Codex 的 sandbox 不能開子行程、不能寫專案以外的檔案。
+// 所以回報程式只把「哪一輪、哪一段、一段話」POST 到這裡，該做的事全在 gateway 做：
+//
+//   fiat   回報；這一輪是連續版（`go` 記著）的話，替它注入 `go`
+//   built  把專案的 skill 裝進 OpenClaw、在房間上線（等同 /fiat -install），再回報
+//   done   更新 .tap 的 timestamp、回報，並排好關掉 session
+//
+// 每一段重複回報都不會出事：-go 用過就消掉、裝過的照裝、關 session 只排一次。
+//
+// 哪一輪，是從回報程式送來的房間（專案的 .tap）與專案目錄認的：房間綁的就是這個專案、
+// 而且有一個 /fiat 開著的 session，才算數。回報程式拿不到別的線索——Codex 的對話被使用者
+// 從手機接手之後，是在 Codex app 裡接著跑的，那裡沒有 /fiat 叫起時的環境變數。
+// 房間被 -uninstall、專案換了、session 已經關了，就什麼都不做，只告訴它。
+
+const REPORT_STAGES = new Set(["fiat", "built", "done"]);
+
+async function receiveReport(api, req, res) {
+  const answer = (status, body) => {
+    res.statusCode = status;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.end(JSON.stringify(body));
+    return true;
+  };
+  if (req.method !== "POST") return answer(405, { error: "POST a report here." });
+  // 只收本機程式送的：瀏覽器跨站送來的一定帶 Origin，而 JSON 的 POST 會先被 preflight 擋下。
+  if (req.headers.origin || !/^application\/json\b/i.test(String(req.headers["content-type"] ?? ""))) {
+    return answer(403, { error: "Reports come from the /tap report program only." });
+  }
+  let request;
+  try {
+    request = JSON.parse(await readBody(req, 256 * 1024));
+  } catch (error) {
+    return answer(400, { error: `not a report: ${String(error?.message || error)}` });
+  }
+  const { room, dir, stage } = request ?? {};
+  if (!REPORT_STAGES.has(stage)) return answer(400, { error: `unknown stage "${stage}"` });
+  if (!room?.channel || !room?.target || typeof dir !== "string") return answer(400, { error: "a report needs the room and the project directory." });
+
+  const fiatConfig = fiatConfigOf(liveConfig(api));
+  if (!fiatConfig) return answer(404, { error: "/fiat is not configured on this gateway." });
+  const settings = fiatSettings(fiatConfig);
+  const key = roomKey({ channel: String(room.channel), target: String(room.target) });
+  const entry = readIndex(settings.projectsFile)[key];
+  if (!entry?.pid || !samePath(entry.dir, dir)) {
+    return answer(409, { error: "No /fiat round is open for this project in its room, so nothing was reported." });
+  }
+  const text = await report(settings, key, entry, stage, String(request.message ?? "").trim());
+  return answer(200, { text });
+}
+
+/** 一個 POST 的本文，太長就不收。 */
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error("too long"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+/** 路由拿不到指令的 ctx：設定從 gateway 當下那一份取，取不到才用載入時的。 */
+const liveConfig = (api) => api.runtime?.config?.current?.()?.plugins?.entries?.[PLUGIN_ID]?.config ?? api.pluginConfig ?? {};
+
+/** Windows 上大小寫、斜線方向都不算數。 */
+const samePath = (a, b) => lower(resolve(String(a ?? ""))) === lower(resolve(String(b ?? "")));
+
+async function report(settings, key, entry, stage, message) {
+  const room = roomOf(key);
+  const name = entry.name;
+  const done = [];
+  const lines = [];
+  if (stage === "fiat") {
+    lines.push(`${name}: FIAT ready`, message, entry.go ? "Implementing it now (-go)." : "Read it, then /fiat -go to implement.");
+  } else if (stage === "built") {
+    lines.push(`${name}: built`, message);
+    const installed = await installSkill({ ...settings, name, dir: entry.dir, agent: entry.agent, installedDir: entry.installedDir });
+    if (installed.error) {
+      lines.push(`not installed: ${installed.error}`);
+      done.push(`not installed: ${installed.error}`);
+    } else {
+      patchRoom(settings.projectsFile, key, { installed: true, skill: installed.skill, installedDir: installed.installedDir });
+      lines.push(`Installed ${installed.skill}: live in this room now. Test it here, then /fiat -done.`);
+      done.push("installed");
+    }
+  } else {
+    // 下一輪 /tap 從這裡開始汲取。這一步排在最前面：後面不管哪一步出事，它都已經做了。
+    const stamp = localStamp();
+    const tapFile = tapFileOf(entry.dir);
+    if (tapFile) {
+      patchTap(tapFile, { timestamp: stamp });
+      done.push(`timestamp ${stamp}`);
+    }
+    const closing = `Closing ${sessionLabel(settings, entry)}.`;
+    lines.push(`${name}: done`, message, tapFile ? `timestamp: ${stamp}. ${closing}` : closing);
+  }
+
+  const sent = await notify(settings.openclaw, room, lines.filter(Boolean).join("\n"));
+  done.push(sent.ok ? "reported to the room" : `could not report to the room: ${sent.failure}`);
+
+  if (entry.pid && stage === "fiat" && entry.go) {
+    patchRoom(settings.projectsFile, key, { go: undefined });
+    const queued = await inject(sessionRunner(settings, entry), entry.pid, "go");
+    if (!queued.ok) done.push(`could not send go: ${queued.failure}`);
+  }
+  if (entry.pid && stage === "done") {
+    // pid 留著：那是關它的把手。
+    patchRoom(settings.projectsFile, key, { closing: true, go: undefined });
+    closeSoon(settings, key, entry);
+    done.push("this session will be closed shortly");
+  }
+  return `${done.join("; ")}.`;
 }
 
 export default definePluginEntry({
@@ -783,9 +914,16 @@ export default definePluginEntry({
     });
     api.registerCommand({
       name: "fiat",
-      description: "Start Claude Code on this room's project: /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go]",
+      description: "Start an AI coder on this room's project: /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go] [-claude|-codex]",
       acceptsArgs: true,
       handler: (ctx) => fiat(api, ctx),
+    });
+    // 憑證由這個 plugin 自己驗（每一輪一個），不走 gateway 的登入。
+    api.registerHttpRoute({
+      path: REPORT_ROUTE,
+      auth: "plugin",
+      match: "exact",
+      handler: (req, res) => receiveReport(api, req, res),
     });
   },
 });

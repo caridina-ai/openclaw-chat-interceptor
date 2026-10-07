@@ -2,7 +2,7 @@
   "id": "openclaw-chat-interceptor",
   "name": "Chat Interceptor",
   "description": "Runs a per-room script before the agent replies; falls through to the AI when the script declines.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "activation": {
     "onStartup": true,
     "onCapabilities": [
@@ -41,7 +41,7 @@
         "required": [
           "projectsDir"
         ],
-        "description": "Enables the /fiat command: start Claude Code (through ccrun) on the project bound to the current room and have it run its /tap skill. A project is an OpenClaw skill (SKILL.md plus scripts/intercept.*); installing it copies it into the room's agent workspace with `openclaw skills install`, and the room's route runs the installed copy. Omit this block and /fiat only says it is not configured.",
+        "description": "Enables the /fiat command: start an AI coder (Claude Code through ccrun, or Codex through cdrun) on the project bound to the current room and have it run its /tap skill. A project is an OpenClaw skill (SKILL.md plus scripts/intercept.*); installing it copies it into the room's agent workspace with `openclaw skills install`, and the room's route runs the installed copy. Omit this block and /fiat only says it is not configured.",
         "properties": {
           "projectsDir": {
             "type": "string",
@@ -51,13 +51,28 @@
             "type": "string",
             "description": "Where the room-to-project table is kept, one entry per conversation: which project the room belongs to, whether its script is installed, and the open Claude Code session. Defaults to ~/.openclaw/chat-interceptor-projects.json. It holds conversation ids, so it lives in the state directory rather than in any project."
           },
+          "harness": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "description": "Which AI /fiat starts when the command does not say -claude or -codex. Defaults to \"claude\"."
+          },
           "ccrun": {
             "type": "array",
             "minItems": 1,
             "items": {
               "type": "string"
             },
-            "description": "argv of ccrun (github.com/neritina-ai/cli-ccrun), which starts Claude Code in a console of its own with Remote Control on and types prompts into it by PID. Defaults to [\"ccrun\"]. Use an absolute path: the gateway runs as a service and its PATH may differ from a shell."
+            "description": "argv of ccrun (github.com/neritina-ai/cli-ccrun), which starts Claude Code in a console of its own with Remote Control on and types prompts into it by PID. Only needed for Claude Code. Defaults to [\"ccrun\"]. Use an absolute path: the gateway runs as a service and its PATH may differ from a shell."
+          },
+          "cdrun": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            },
+            "description": "argv of cdrun (github.com/caridina-ai/cli-cdrun), which starts a background Codex session and sends prompts to it by PID. Only needed for Codex. Defaults to [\"cdrun\"]. Use an absolute path: the gateway runs as a service and its PATH may differ from a shell."
           },
           "openclaw": {
             "type": "array",

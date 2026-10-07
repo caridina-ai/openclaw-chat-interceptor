@@ -1,9 +1,5 @@
-// plugin 與回報程式共用的部分。
-//
-// 回報程式（report.mjs）是 Claude Code 在 session 裡用 node 直接跑的，
-// 不經過 gateway，所以它碰得到的只有這一份：房間怎麼認、對照表怎麼讀寫、
-// `.tap` 長什麼樣、script 怎麼找、訊息怎麼送、ccrun 怎麼叫。
-// 這裡不 import openclaw 的 SDK，兩邊才都載得起來。
+// plugin 的機械部分：房間怎麼認、對照表怎麼讀寫、`.tap` 長什麼樣、script 怎麼找、
+// 訊息怎麼送、寫程式的 AI 怎麼叫。不 import openclaw 的 SDK，測試才載得起來。
 
 import { execFile } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -12,7 +8,17 @@ import { basename, delimiter, dirname, extname, join } from "node:path";
 
 export const DEFAULT_PROJECTS_FILE = join(homedir(), ".openclaw", "chat-interceptor-projects.json");
 export const DEFAULT_OPENCLAW = ["openclaw"];
-export const DEFAULT_CCRUN = ["ccrun"];
+
+/**
+ * /fiat 叫得起的 AI harness，以及叫它們的程式。兩支程式的介面一模一樣：
+ * `-d <dir> [prompt]` 開（印出 pid）、`-p <pid> <text>` 打字、`-p <pid> -s` 看、`-p <pid> -q` 關。
+ * 設定裡 `fiat.<runner>` 是它的 argv，沒設就在 PATH 上找。
+ */
+export const HARNESSES = {
+  claude: { label: "Claude Code", runner: "ccrun" },
+  codex: { label: "Codex", runner: "cdrun" },
+};
+export const DEFAULT_HARNESS = "claude";
 
 // OpenClaw 自己在 hook-agent-context.ts 用的同一組 conversation prefix。
 const CONVERSATION_PREFIXES = new Set(["channel", "chat", "direct", "dm", "group", "thread", "user"]);
@@ -71,12 +77,14 @@ export function roomOf(key) {
 // ---------------------------------------------------------------------------
 // 房間 → 專案的對照表
 // ---------------------------------------------------------------------------
-// 一個房間一筆：`{ name, dir, agent, installed, skill, installedDir, pid, go, closing }`。
+// 一個房間一筆：`{ name, dir, agent, installed, skill, installedDir, harness, pid, token, go, closing }`。
 //   name / dir     這個房間綁的是哪個專案（開發目錄）
 //   agent          這個房間的 OpenClaw agent，skill 裝進它的 workspace
 //   installed      裝上了：`installedDir` 是 OpenClaw 裡那一份上線版，route 跑的是它的 script
 //   skill          裝上去的 skill 名字
-//   pid            開著的 Claude Code session（ccrun 的把手）
+//   harness        開著的那個 session 是哪一種 AI（HARNESSES 的 key）
+//   pid            開著的 session（ccrun／cdrun 的把手）
+//   token          這一輪的回報憑證：回報程式拿它找到這一筆，舊 session 拿不到新一輪的
 //   go             這一輪是不是連續版：FIAT 文件寫好，回報程式就注入 `go`
 //   closing        回報程式說這一輪做完了，等 gateway 把 session 關掉
 //
@@ -298,7 +306,7 @@ export function deriveRoute(interpreters, project) {
 }
 
 // ---------------------------------------------------------------------------
-// 外部指令：送訊息、叫 ccrun
+// 外部指令：送訊息、叫 ccrun／cdrun
 // ---------------------------------------------------------------------------
 
 /** 跑一支外部指令，永遠 resolve：`ok` 是它有沒有乾淨地結束。 */
@@ -335,34 +343,29 @@ export const notify = (openclaw, room, text) =>
     text,
   ]);
 
-const ccrunOf = (ccrun) => (ccrun?.length ? ccrun : DEFAULT_CCRUN);
+/**
+ * 把一句話打進那個 session。對方正在跑一輪的時候也可以打：它會排在這一輪後面。
+ * `runner` 是 ccrun 或 cdrun 的 argv。
+ */
+export const inject = (runner, pid, text) => run(runner, ["-p", String(pid), text]);
 
 /**
- * 把一句話打進那個 Claude Code session 的輸入框。
- *
- * 對方正在跑一輪的時候也可以打：斜線指令會排在那一輪後面才執行。
- * 回報程式就是靠這一點，在 session 自己的一輪裡替它排好下一步。
+ * 關掉那個 session：請它結束，十秒內沒走（例如卡在確認對話框）就直接結束它。
+ * 只能從 session **外面**叫：它會等 session 結束。
  */
-export const inject = (ccrun, pid, text) => run(ccrunOf(ccrun), ["-p", String(pid), text]);
+export const quit = (runner, pid) => run(runner, ["-p", String(pid), "-q"]);
 
-/**
- * 關掉那個 session：ccrun 打 `/exit`，十秒內沒走（例如卡在「還有背景工作，確定要離開嗎」）
- * 就直接結束它。只能從 session **外面**叫：它會等 session 結束，而在 session 裡面叫的話，
- * session 正在等它。
- */
-export const quit = (ccrun, pid) => run(ccrunOf(ccrun), ["-p", String(pid), "-q"]);
-
-/** 那個 pid 還是不是一個開著的 Claude Code。ccrun 會順便確認它是 claude.exe。 */
-export async function sessionAlive(ccrun, pid) {
+/** 那個 pid 還是不是一個開著的 session。runner 會順便確認它是自己叫起的那一種。 */
+export async function sessionAlive(runner, pid) {
   if (!pid) return false;
-  return (await run(ccrunOf(ccrun), ["-p", String(pid), "-s"])).ok;
+  return (await run(runner, ["-p", String(pid), "-s"])).ok;
 }
 
-/** 在 dir 開一個 Claude Code session，第一句話是 prompt。回傳 pid。 */
-export async function launch(ccrun, dir, prompt, env) {
-  // ccrun 會等 session 真的能打字才回來，冷啟動要十幾秒以上。
-  const result = await run(ccrunOf(ccrun), ["-d", dir, prompt], { timeout: 120_000, env });
+/** 在 dir 開一個 session，第一句話是 prompt。回傳 pid。 */
+export async function launch(runner, dir, prompt, env) {
+  // runner 會等 session 真的能接話才回來，冷啟動要十幾秒以上。
+  const result = await run(runner, ["-d", dir, prompt], { timeout: 120_000, env });
   const pid = Number(/^\s*(\d+)\s*$/m.exec(result.stdout)?.[1]);
   if (result.ok && pid) return { pid };
-  return { error: result.failure || result.stdout || "ccrun did not print a pid" };
+  return { error: result.failure || result.stdout || `${runner[0]} did not print a pid` };
 }

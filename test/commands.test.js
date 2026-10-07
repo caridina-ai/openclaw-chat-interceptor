@@ -1,5 +1,5 @@
 // `/aside` 與 `/fiat`：OpenClaw 的 slash command，不經過攔截 hook。
-// ccrun 與 `openclaw message send` 都換成 fixture，所以不需要 Claude Code，也不會送出訊息。
+// ccrun、cdrun 與 `openclaw message send` 都換成 fixture，所以不需要 Claude Code 或 Codex，也不會送出訊息。
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -10,7 +10,7 @@ import {
   PLUGIN_ID,
   READ_STDIN,
   TELEGRAM_CHAT,
-  fakeCcrun,
+  fakeRunner,
   fakeOpenclaw,
   fixture,
   readJsonLines,
@@ -27,12 +27,14 @@ let dir;
 let hook;
 let commands;
 let CCRUN;
+let CDRUN;
 let OPENCLAW;
 let ECHO;
 
 before(() => {
   dir = tempDir("chat-interceptor-commands-");
-  CCRUN = fakeCcrun(dir);
+  CCRUN = fakeRunner(dir, "ccrun");
+  CDRUN = fakeRunner(dir, "cdrun");
   OPENCLAW = fakeOpenclaw(dir);
   ECHO = fixture(dir, "echo.mjs", `${READ_STDIN}process.stdout.write("You said " + payload.body);`);
   ({ hook, commands } = register());
@@ -107,6 +109,22 @@ describe("/aside", () => {
     assert.equal(entry.target, DISCORD_CHAT);
   });
 
+  // Discord 的斜線指令：`to` 是按指令的那個人（`slash:<使用者 id>`），頻道在 sessionKey 與 `from`。
+  it("files a Discord slash-command aside under the channel, not the person", async () => {
+    await aside("hi", {
+      channel: "discord",
+      to: "slash:999999999999999999",
+      from: `discord:channel:${DISCORD_CHAT}`,
+      sessionKey: `agent:main:discord:channel:${DISCORD_CHAT}`,
+    });
+    assert.equal(readOffstage(offstageLogFile)[0].target, DISCORD_CHAT);
+  });
+
+  it("falls back to `from` for a Discord slash command without a channel session key", async () => {
+    await aside("hi", { channel: "discord", to: "slash:999999999999999999", from: `discord:channel:${DISCORD_CHAT}` });
+    assert.equal(readOffstage(offstageLogFile)[0].target, DISCORD_CHAT);
+  });
+
   it("tells the user when the aside could not be written", async () => {
     // The parent of this path is a regular file, so creating the directory fails.
     const result = await commands.aside.handler(commandCtx("nowhere", { config: { offstageLogFile: join(ECHO[1], "x.log") } }));
@@ -117,7 +135,7 @@ describe("/aside", () => {
 describe("/fiat", () => {
   let projects;
   let projectsFile;
-  let ccrunLog;
+  let runnerLog;
   let notifyLog;
   let installLog;
   let workspace;
@@ -127,7 +145,7 @@ describe("/fiat", () => {
   // ~/.openclaw/chat-interceptor-projects.json。
   const settings = (overrides = {}) => ({
     offstageLogFile: join(dir, "offstage-unused.log"),
-    fiat: { projectsDir: projects, projectsFile, ccrun: CCRUN, openclaw: OPENCLAW, ...overrides },
+    fiat: { projectsDir: projects, projectsFile, ccrun: CCRUN, cdrun: CDRUN, openclaw: OPENCLAW, ...overrides },
   });
   const fiat = (args, { config, ...overrides } = {}) =>
     commands.fiat.handler(commandCtx(args, { config: config ?? settings(), ...overrides }));
@@ -136,7 +154,7 @@ describe("/fiat", () => {
   const readIndex = () => (existsSync(projectsFile) ? JSON.parse(readFileSync(projectsFile, "utf8")) : {});
   const entry = () => readIndex()[`telegram:${TELEGRAM_CHAT}`];
   const setEntry = (value) => writeFileSync(projectsFile, JSON.stringify({ [`telegram:${TELEGRAM_CHAT}`]: value }), "utf8");
-  const ccrunCalls = (mode) => readJsonLines(ccrunLog).filter((call) => call.mode === mode);
+  const calls = (mode) => readJsonLines(runnerLog).filter((call) => call.mode === mode);
 
   const seed = (name, body) => {
     const file = join(projects, name, "genesis", ".tap");
@@ -158,17 +176,17 @@ describe("/fiat", () => {
     seq += 1;
     projects = mkdtempSync(join(dir, "projects-"));
     projectsFile = join(dir, `projects-${seq}.json`);
-    ccrunLog = join(dir, `ccrun-${seq}.log`);
+    runnerLog = join(dir, `runner-${seq}.log`);
     notifyLog = join(dir, `notify-${seq}.log`);
     installLog = join(dir, `install-${seq}.log`);
     workspace = join(dir, `workspace-${seq}`);
-    process.env.CCRUN_LOG = ccrunLog;
+    process.env.RUNNER_LOG = runnerLog;
     process.env.NOTIFY_LOG = notifyLog;
     process.env.INSTALL_LOG = installLog;
     process.env.FAKE_WORKSPACE = workspace;
-    delete process.env.CCRUN_ALIVE;
-    delete process.env.CCRUN_FAIL;
-    delete process.env.CCRUN_DELAY;
+    delete process.env.RUNNER_ALIVE;
+    delete process.env.RUNNER_FAIL;
+    delete process.env.RUNNER_DELAY;
   });
 
   it("says so when the fiat block is missing", async () => {
@@ -186,27 +204,22 @@ describe("/fiat", () => {
       assert.equal(readFileSync(join(dirOf, ".gitignore"), "utf8"), ".tap\n");
 
       assert.equal(await started(), 4242);
-      const [launch] = ccrunCalls("launch");
+      const [launch] = calls("launch");
       assert.ok(samePath(launch.dir, dirOf), launch.dir);
       assert.equal(launch.prompt, "/tap");
       assert.equal(entry().name, "ledger");
       assert.equal(entry().go, undefined);
     });
 
-    it("hands the session the report program and everything it needs", async () => {
+    // 那一側什麼都不必知道：回報程式跟著 /tap 技能走，房間從專案的 .tap 認。
+    it("starts the session with nothing but the project and /tap", async () => {
       await reply("ledger");
       await started();
-      const [launch] = ccrunCalls("launch");
-      assert.ok(existsSync(launch.report), launch.report);
-      assert.match(launch.report, /report\.mjs$/);
-      const context = JSON.parse(launch.context);
-      assert.equal(context.room, `telegram:${TELEGRAM_CHAT}`);
-      assert.equal(context.name, "ledger");
-      assert.equal(context.projectsFile, projectsFile);
-      assert.deepEqual(context.ccrun, CCRUN);
-      assert.deepEqual(context.openclaw, OPENCLAW);
+      const [launch] = calls("launch");
+      assert.equal(launch.report, undefined);
+      assert.equal(launch.context, undefined);
+      assert.equal(entry().harness, "claude");
       // skill 要裝進這個房間的 agent：OpenClaw 在指令的 ctx 裡給了。
-      assert.equal(context.agent, "main");
       assert.equal(entry().agent, "main");
     });
 
@@ -214,7 +227,7 @@ describe("/fiat", () => {
       const text = await reply("ledger -t 2026-09-01 10:00 -go");
       assert.match(text, /\(new project, from 2026-09-01 10:00, -go\): \/tap 2026-09-01 10:00\./);
       await started();
-      assert.equal(ccrunCalls("launch")[0].prompt, "/tap 2026-09-01 10:00");
+      assert.equal(calls("launch")[0].prompt, "/tap 2026-09-01 10:00");
       assert.equal(entry().go, true);
     });
 
@@ -225,7 +238,7 @@ describe("/fiat", () => {
       it(`accepts ${JSON.stringify(args)}`, async () => {
         await reply(args);
         await started();
-        assert.equal(ccrunCalls("launch")[0].prompt, prompt);
+        assert.equal(calls("launch")[0].prompt, prompt);
       });
     }
 
@@ -239,12 +252,12 @@ describe("/fiat", () => {
       await reply("ledger");
       await started();
       setEntry({ ...entry(), pid: undefined });
-      process.env.CCRUN_PID = "4343";
+      process.env.RUNNER_PID = "4343";
       try {
         assert.match(await reply(""), /^fiat: starting Claude Code for ledger: \/tap\./);
         assert.equal(await waitFor(() => entry()?.pid === 4343 && 4343, "the second session"), 4343);
       } finally {
-        delete process.env.CCRUN_PID;
+        delete process.env.RUNNER_PID;
       }
     });
 
@@ -278,7 +291,7 @@ describe("/fiat", () => {
         await reply("ledger"),
         "fiat: ledger already exists and belongs to no room here. To bring it here: /fiat -install ledger.",
       );
-      assert.equal(readJsonLines(ccrunLog).length, 0);
+      assert.equal(readJsonLines(runnerLog).length, 0);
     });
 
     // 換綁定只有一條路：-uninstall 再 -install。
@@ -302,12 +315,12 @@ describe("/fiat", () => {
 
     it("refuses to open a second session while one is open", async () => {
       setEntry({ name: "ledger", dir: join(projects, "ledger"), pid: 4242 });
-      process.env.CCRUN_ALIVE = "4242";
+      process.env.RUNNER_ALIVE = "4242";
       assert.equal(
         await reply(""),
-        "fiat: Claude Code is already open for ledger (pid 4242). /fiat -go (or go in Claude Code) to implement, /fiat -done to finish.",
+        "fiat: Claude Code is already open for ledger (pid 4242). /fiat -go to implement, /fiat -done to finish.",
       );
-      assert.equal(ccrunCalls("launch").length, 0);
+      assert.equal(calls("launch").length, 0);
     });
 
     it("starts afresh when the recorded session is no longer running", async () => {
@@ -318,19 +331,56 @@ describe("/fiat", () => {
     });
 
     it("says so while Claude Code is still starting", async () => {
-      process.env.CCRUN_DELAY = "400";
+      process.env.RUNNER_DELAY = "400";
       await reply("ledger");
       assert.equal(await reply(""), "fiat: Claude Code for ledger is still starting.");
       await started();
     });
 
     it("reports a launch that failed", async () => {
-      process.env.CCRUN_FAIL = "claude not found on PATH";
+      process.env.RUNNER_FAIL = "claude not found on PATH";
       await reply("ledger");
       const [notify] = await waitFor(() => readJsonLines(notifyLog).length && readJsonLines(notifyLog), "the failure report");
       assert.deepEqual(notify.slice(0, 5), ["--channel", "telegram", "--target", TELEGRAM_CHAT, "--message"]);
       assert.equal(notify[5], "fiat: could not start Claude Code for ledger: claude not found on PATH");
       assert.equal(entry().pid, undefined);
+    });
+
+    describe("which AI", () => {
+      it("starts Codex through cdrun with -codex", async () => {
+        assert.match(await reply("ledger -codex"), /^fiat: starting Codex for ledger \(new project\): \/tap\. /);
+        await started();
+        assert.deepEqual(calls("launch").map((call) => [call.runner, call.prompt]), [["cdrun", "/tap"]]);
+        assert.equal(entry().harness, "codex");
+      });
+
+      it("uses the configured default", async () => {
+        const config = settings({ harness: "codex" });
+        assert.match(await reply("ledger", { config }), /^fiat: starting Codex for ledger /);
+        await started();
+        assert.equal(calls("launch")[0].runner, "cdrun");
+      });
+
+      it("lets -claude override the configured default", async () => {
+        const config = settings({ harness: "codex" });
+        assert.match(await reply("ledger -claude -go", { config }), /^fiat: starting Claude Code for ledger \(new project, -go\)/);
+        await started();
+        assert.equal(calls("launch")[0].runner, "ccrun");
+      });
+
+      it("talks to an open session through the runner that started it", async () => {
+        mkdirSync(join(projects, "ledger"), { recursive: true });
+        setEntry({ name: "ledger", dir: join(projects, "ledger"), harness: "codex", pid: 4242 });
+        process.env.RUNNER_ALIVE = "4242";
+        assert.equal(await reply("-go"), "fiat: asked Codex to go on and implement the FIAT. It reports here when it is built.");
+        assert.deepEqual(calls("inject"), [{ runner: "cdrun", mode: "inject", pid: 4242, text: "go" }]);
+        assert.equal(
+          await reply("-claude"),
+          "fiat: Codex is already open for ledger (pid 4242). /fiat -go to implement, /fiat -done to finish.",
+        );
+        assert.match(await reply("-claude -go"), /^fiat: Codex is already open for ledger /);
+        assert.equal(calls("inject").length, 1);
+      });
     });
 
     it("only lets allowFrom accounts start a round", async () => {
@@ -354,16 +404,26 @@ describe("/fiat", () => {
     it("shows the project, what is installed, the session and the timestamp", async () => {
       seed("ledger", `channel:   telegram\ntarget:    ${TELEGRAM_CHAT}\ntimestamp: 2026-10-02 21:45\n`);
       setEntry({ name: "ledger", dir: join(projects, "ledger"), installed: true, skill: "ledger-skill", pid: 4242 });
-      process.env.CCRUN_ALIVE = "4242";
+      process.env.RUNNER_ALIVE = "4242";
       assert.equal(await reply("?"), "project: ledger\ninstalled: ledger-skill\nClaude Code: pid 4242\ntimestamp: 2026-10-02 21:45");
-      assert.deepEqual(ccrunCalls("inject"), []);
+      assert.deepEqual(calls("inject"), []);
+    });
+
+    it("names the AI of the open session, or the one /fiat would start", async () => {
+      seed("ledger", here);
+      setEntry({ name: "ledger", dir: join(projects, "ledger"), harness: "codex", pid: 4242 });
+      process.env.RUNNER_ALIVE = "4242";
+      assert.match(await reply("?"), /\nCodex: pid 4242\n/);
+      delete process.env.RUNNER_ALIVE;
+      assert.match(await reply("?"), /\nClaude Code: not running\n/);
+      assert.match(await reply("?", { config: settings({ harness: "codex" }) }), /\nCodex: not running\n/);
     });
 
     it("never starts Claude Code, even for a bound room with no session", async () => {
       seed("ledger", here);
       setEntry({ name: "ledger", dir: join(projects, "ledger") });
       assert.equal(await reply("?"), "project: ledger\ninstalled: no\nClaude Code: not running\ntimestamp: none");
-      assert.deepEqual(ccrunCalls("launch"), []);
+      assert.deepEqual(calls("launch"), []);
       assert.equal(entry().pid, undefined);
     });
 
@@ -384,7 +444,7 @@ describe("/fiat", () => {
     beforeEach(() => {
       mkdirSync(join(projects, "ledger"), { recursive: true });
       setEntry({ name: "ledger", dir: join(projects, "ledger"), pid: 4242 });
-      process.env.CCRUN_ALIVE = "4242";
+      process.env.RUNNER_ALIVE = "4242";
     });
 
     // -go 永遠是「接下來一路自動做到裝好」：已經開著，就是請它接著做，不另開一個。
@@ -392,66 +452,41 @@ describe("/fiat", () => {
     for (const args of ["-go", "ledger -go"]) {
       it(`${args} sends go`, async () => {
         assert.equal(await reply(args), "fiat: asked Claude Code to go on and implement the FIAT. It reports here when it is built.");
-        assert.deepEqual(ccrunCalls("inject"), [{ mode: "inject", pid: 4242, text: "go" }]);
-        assert.equal(ccrunCalls("launch").length, 0);
+        assert.deepEqual(calls("inject"), [{ runner: "ccrun", mode: "inject", pid: 4242, text: "go" }]);
+        assert.equal(calls("launch").length, 0);
       });
     }
 
     it("-go with a start time cannot restart an open round", async () => {
       assert.match(await reply("-t 2026-09-01 -go"), /^fiat: Claude Code is already open for ledger /);
-      assert.deepEqual(ccrunCalls("inject"), []);
+      assert.deepEqual(calls("inject"), []);
     });
 
     it("-done asks it to commit and wrap up", async () => {
       assert.equal(await reply("-done"), "fiat: asked Claude Code to commit and wrap up. It reports here when it is done.");
-      assert.deepEqual(ccrunCalls("inject"), [{ mode: "inject", pid: 4242, text: "/tap -done" }]);
+      assert.deepEqual(calls("inject"), [{ runner: "ccrun", mode: "inject", pid: 4242, text: "/tap -done" }]);
     });
 
-    // 關 session 是 gateway 從外面關的：session 自己打 /exit 可能卡在確認對話框。
-    describe("closing", () => {
-      beforeEach(() => {
-        process.env.FIAT_CLOSE_POLL_MS = "20";
-        process.env.FIAT_CLOSE_GRACE_MS = "20";
-      });
-
-      it("closes the session from outside once the round reports done", async () => {
-        await reply("-done");
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        assert.deepEqual(ccrunCalls("quit"), [], "nothing is closed before the report says so");
-
-        setEntry({ ...entry(), closing: true }); // 回報程式在 done 那一段做的事
-        await waitFor(() => ccrunCalls("quit").length, "the session to be closed");
-        assert.deepEqual(ccrunCalls("quit"), [{ mode: "quit", pid: 4242 }]);
-        await waitFor(() => entry().pid === undefined, "the pid to be cleared");
-        assert.equal(entry().closing, undefined);
-      });
-
-      it("keeps the pid until it is really closed, so a second -done can still find it", async () => {
-        setEntry({ ...entry(), closing: true });
-        assert.equal(await reply("-done"), "fiat: Claude Code for ledger is closed.");
-        assert.deepEqual(ccrunCalls("quit"), [{ mode: "quit", pid: 4242 }]);
-        assert.deepEqual(ccrunCalls("inject"), [], "the round already wrapped up; do not ask again");
-        assert.equal(entry().pid, undefined);
-      });
-
-      it("stops waiting when the room moves on", async () => {
-        await reply("-done");
-        setEntry({ name: "ledger", dir: join(projects, "ledger"), closing: true }); // pid 被清掉了
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        assert.deepEqual(ccrunCalls("quit"), []);
-      });
+    // 平常是回報 done 之後由 gateway 關（見 report.test.js）。gateway 在那之間重啟過的話，
+    // session 停在 closing，再打一次 -done 就直接關。
+    it("-done closes a session that already reported done", async () => {
+      setEntry({ ...entry(), closing: true });
+      assert.equal(await reply("-done"), "fiat: Claude Code for ledger is closed.");
+      assert.deepEqual(calls("quit"), [{ runner: "ccrun", mode: "quit", pid: 4242 }]);
+      assert.deepEqual(calls("inject"), [], "the round already wrapped up; do not ask again");
+      assert.deepEqual(entry(), { name: "ledger", dir: join(projects, "ledger") });
     });
 
     it("-done says so when no session is open, and forgets the stale pid", async () => {
-      delete process.env.CCRUN_ALIVE;
+      delete process.env.RUNNER_ALIVE;
       assert.equal(await reply("-done"), "fiat: no Claude Code session is open for ledger.");
-      assert.equal(ccrunCalls("inject").length, 0);
+      assert.equal(calls("inject").length, 0);
       assert.equal(entry().pid, undefined);
     });
 
     // 連續版：沒有 session 開著時，-go 是「維護舊專案，一路做到裝好」。
     it("-go starts a continuous round when no session is open", async () => {
-      delete process.env.CCRUN_ALIVE;
+      delete process.env.RUNNER_ALIVE;
       assert.match(await reply("-go"), /^fiat: starting Claude Code for ledger \(-go\): \/tap\. /);
       await started();
       assert.equal(entry().go, true);
@@ -590,7 +625,7 @@ describe("/fiat", () => {
     it("never starts Claude Code", async () => {
       seedProject("ledger");
       await reply("-install ledger");
-      assert.equal(readJsonLines(ccrunLog).length, 0);
+      assert.equal(readJsonLines(runnerLog).length, 0);
     });
 
     // 舊版裝的（沒有 installedDir）不算數：那是直接跑開發目錄的，目錄一搬走整個房間就開始報錯。
@@ -623,7 +658,7 @@ describe("/fiat", () => {
 
     it("mentions a session that is still open", async () => {
       setEntry({ name: "ledger", dir: join(projects, "ledger"), pid: 4242 });
-      process.env.CCRUN_ALIVE = "4242";
+      process.env.RUNNER_ALIVE = "4242";
       assert.match(await reply("-uninstall"), /Its Claude Code session \(pid 4242\) is still open\.$/);
     });
 
@@ -661,10 +696,15 @@ describe("/fiat", () => {
       ["2026-09-01", /^fiat: a start time needs -t\. Did you mean: \/fiat -t 2026-09-01$/],
       ["ledger 2026-09-28 -go", /^fiat: a start time needs -t\. Did you mean: \/fiat ledger -t 2026-09-28 -go$/],
       ["ledger 2026-09-28 10:00", /^fiat: a start time needs -t\. Did you mean: \/fiat ledger -t 2026-09-28 10:00$/],
+      ["ledger -claude -codex", /^fiat: -claude and -codex do not go together\.$/],
+      ["-install ledger -codex", /^fiat: -install takes nothing but a project name\.$/],
+      ["-done -claude", /^fiat: -done takes no arguments\.$/],
+      ["? -codex", /^fiat: \? takes no arguments\.$/],
+      ["-constructor", /^fiat: unknown option "-constructor"/],
     ]) {
       it(`refuses ${JSON.stringify(args)}`, async () => {
         assert.match(await reply(args), expected);
-        assert.equal(readJsonLines(ccrunLog).length, 0);
+        assert.equal(readJsonLines(runnerLog).length, 0);
         assert.equal(existsSync(join(projects, "2026-09-01")), false);
       });
     }

@@ -1,7 +1,8 @@
-// 測試共用。不需要 gateway、網路、Claude Code 或任何使用者的 script：
+// 測試共用。不需要 gateway、網路、Claude Code、Codex 或任何使用者的 script：
 // 要跑的東西全是寫進暫存目錄的 fixture。
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import entry from "../src/index.js";
@@ -38,12 +39,18 @@ export function fixture(dir, name, source) {
   return [process.execPath, file];
 }
 
-/** 把 plugin 註冊到一個假的 api 上，拿回 hook 與兩個指令。 */
+/**
+ * 把 plugin 註冊到一個假的 api 上，拿回 hook、兩個指令與 HTTP 路由。
+ * `runtimeConfig` 是 gateway 當下那一份設定（回報路由從那裡取），測試可以隨時換掉它。
+ */
 export function register() {
   const commands = {};
+  const routes = {};
   let hook;
-  entry.register({
+  const api = {
     pluginConfig: {},
+    runtimeConfig: {},
+    runtime: { config: { current: () => api.runtimeConfig } },
     logger: { info() {}, warn() {}, error() {} },
     on(name, handler) {
       if (name === "before_dispatch") hook = handler;
@@ -51,9 +58,27 @@ export function register() {
     registerCommand(definition) {
       commands[definition.name] = definition;
     },
-  });
+    registerHttpRoute(route) {
+      routes[route.path] = route;
+    },
+  };
+  entry.register(api);
   assert.ok(hook, "before_dispatch handler was not registered");
-  return { hook, commands };
+  return { hook, commands, routes, api };
+}
+
+/** 把一條 plugin 的 HTTP 路由掛在本機的隨機 port 上，回傳它的網址與關掉它的方法。 */
+export async function serveRoute(route) {
+  const server = createServer((req, res) => {
+    if (new URL(req.url, "http://x").pathname !== route.path) {
+      res.statusCode = 404;
+      res.end();
+      return;
+    }
+    route.handler(req, res);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return { url: `http://127.0.0.1:${server.address().port}${route.path}`, close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
 /** offstage log 一行一筆 `<當地時間> <JSON>`。 */
@@ -98,28 +123,28 @@ export async function waitFor(read, label) {
 export const samePath = (a, b) => realpathSync(a).toLowerCase() === realpathSync(b).toLowerCase();
 
 /**
- * 假的 ccrun。每一次被叫都在 CCRUN_LOG 記一行，行為照 ccrun 的介面：
- *   -d <dir> <prompt>   印出 pid（CCRUN_PID，預設 4242）；CCRUN_FAIL 有值就失敗
- *   -p <pid> -s         pid 列在 CCRUN_ALIVE 裡才成功
+ * 假的 ccrun／cdrun（兩支介面一樣）。每一次被叫都在 RUNNER_LOG 記一行，帶著自己的名字：
+ *   -d <dir> <prompt>   印出 pid（RUNNER_PID，預設 4242）；RUNNER_FAIL 有值就失敗
+ *   -p <pid> -s         pid 列在 RUNNER_ALIVE 裡才成功
  *   -p <pid> <text>     同上，成功時記下打了什麼
  */
-export function fakeCcrun(dir) {
+export function fakeRunner(dir, name) {
   return fixture(
     dir,
-    "ccrun.mjs",
+    `${name}.mjs`,
     `
     const fs = await import("node:fs");
     const args = process.argv.slice(2);
-    const log = (entry) => fs.appendFileSync(process.env.CCRUN_LOG, JSON.stringify(entry) + "\\n", "utf8");
+    const log = (entry) => fs.appendFileSync(process.env.RUNNER_LOG, JSON.stringify({ runner: "${name}", ...entry }) + "\\n", "utf8");
     if (args[0] === "-d") {
-      await new Promise((r) => setTimeout(r, Number(process.env.CCRUN_DELAY || 0)));
+      await new Promise((r) => setTimeout(r, Number(process.env.RUNNER_DELAY || 0)));
       log({ mode: "launch", dir: args[1], prompt: args[2], report: process.env.FIAT_REPORT, context: process.env.FIAT_CONTEXT });
-      if (process.env.CCRUN_FAIL) { process.stderr.write(process.env.CCRUN_FAIL); process.exit(1); }
-      process.stdout.write((process.env.CCRUN_PID || "4242") + "\\n");
+      if (process.env.RUNNER_FAIL) { process.stderr.write(process.env.RUNNER_FAIL); process.exit(1); }
+      process.stdout.write((process.env.RUNNER_PID || "4242") + "\\n");
       process.exit(0);
     }
-    const alive = String(process.env.CCRUN_ALIVE || "").split(",").includes(args[1]);
-    if (!alive) { process.stderr.write("pid " + args[1] + " is not claude.exe"); process.exit(1); }
+    const alive = String(process.env.RUNNER_ALIVE || "").split(",").includes(args[1]);
+    if (!alive) { process.stderr.write("pid " + args[1] + " is not a session of mine"); process.exit(1); }
     if (args[2] === "-q") log({ mode: "quit", pid: Number(args[1]) });
     else if (args[2] !== "-s") log({ mode: "inject", pid: Number(args[1]), text: args[2] });
     process.exit(0);`,
