@@ -11,8 +11,8 @@
 // 本檔做三件事：
 //   1. 依房間挑出 route，把訊息餵給那支 script，再依 exit code 決定「處理掉」還是
 //      「放行給 AI」。AI 沒看到的那些，一律記進 offstage log。斜線指令不送 script。
-//   2. `/aside`：OpenClaw 的 slash command。留一句話，AI 與 script 都收不到，
-//      只記進 offstage log。
+//   2. `/aside`：留一句話，AI 與 script 都收不到，只記進 offstage log。人打的、AI 寫的都算；
+//      這個 plugin 送出去的每一則訊息也算，只是開頭的 `/aside` 是一個看不見的記號。
 //   3. `/fiat`：OpenClaw 的 slash command。用 ccrun 叫起 Claude Code、或用 cdrun 叫起
 //      Codex，請它施展 /tap 技能，把房間裡聊出來的東西做成軟體。它每一段結束時的回報，
 //      從 gateway 的 HTTP 路由回到這裡。
@@ -22,11 +22,14 @@ import { execFile } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import {
   DEFAULT_HARNESS,
   DEFAULT_PROJECTS_FILE,
   HARNESSES,
+  asAside,
+  asideOf,
   deriveRoute,
   inject,
   installSkill,
@@ -35,6 +38,7 @@ import {
   lower,
   normalizeTarget,
   notify,
+  openclawOf,
   patchRoom,
   patchTap,
   quit,
@@ -42,7 +46,6 @@ import {
   readTap,
   removeInstalledSkill,
   roomKey,
-  roomOf,
   sessionAlive,
   skillDirOf,
   tapFileOf,
@@ -58,6 +61,9 @@ const REPORT_ROUTE = "/chat-interceptor/report";
 
 /** script 用這個 exit code 說「這句我不會，請交給 AI」。 */
 const EXIT_PASS = 20;
+
+/** script 要再送訊息時叫的程式（payload 的 `send`）。 */
+const SEND_SCRIPT = fileURLToPath(new URL("./send.mjs", import.meta.url));
 
 /**
  * 專案名會直接接在 `projectsDir` 後面當路徑用，而它來自不受信任的聊天輸入，
@@ -263,20 +269,63 @@ function runRoute(route, command, payload) {
  */
 async function beforeDispatch(api, event, ctx) {
   const body = String(event?.body ?? event?.content ?? "");
-  // 斜線指令是 OpenClaw 的。這個 hook 跑在指令處理之前，送進 script 的話，
-  // 「其他的話都由我回」的 script 會把 /new、/status 吃掉。
-  if (body.trimStart().startsWith("/")) return;
   const sessionKey = ctx?.sessionKey ?? event?.sessionKey ?? "";
-  const result = await runInterceptedRoute(api, { cleanedBody: body }, {
+  const turn = {
     ...ctx,
     channel: event?.channel ?? ctx?.channelId ?? "",
     chatId: ctx?.conversationId || targetFromSessionKey(sessionKey),
     sessionKey,
     senderId: ctx?.senderId ?? event?.senderId,
     agentId: sessionKey.startsWith("agent:") ? sessionKey.split(":")[1] : "",
-  });
+  };
+  const aside = asideOf(body) ?? asideOf(event?.content) ?? asideTail(turn, body);
+  if (aside) return takeAside(api, turn, aside);
+  // 斜線指令是 OpenClaw 的。這個 hook 跑在指令處理之前，送進 script 的話，
+  // 「其他的話都由我回」的 script 會把 /new、/status 吃掉。
+  if (body.trimStart().startsWith("/")) return;
+  const result = await runInterceptedRoute(api, { cleanedBody: body }, turn);
   if (!result?.handled) return;
-  return { handled: true, ...(result.reply?.text ? { text: result.reply.text } : {}) };
+  // script 的回話是給人看的：其他機器人不必接話。
+  return { handled: true, ...(result.reply?.text ? { text: asAside(result.reply.text) } : {}) };
+}
+
+/**
+ * /aside：不給 AI、不跑 script、不回話，每個房間都一樣。
+ * 它是房間裡的獨白，不是對哪一台說的，所以房間裡每一台都記，`/tap` 在哪一台汲取都看得到。
+ */
+function takeAside(api, ctx, aside) {
+  const config = ctx?.pluginConfig ?? api.pluginConfig ?? {};
+  const channel = ctx.channel;
+  const target = resolveRuntimeTarget(ctx);
+  const senderId = String(ctx?.senderId ?? "");
+  if (senderId && (aside.tail || maybeSplit(aside.text))) {
+    asideTails.set(`${roomKey({ channel, target })}|${senderId}`, { at: Date.now(), bot: aside.bot });
+  }
+  const failure = recordOffstage(config, { kind: "aside", channel, target, senderId, text: aside.text, ...(aside.bot ? { bot: true } : {}) });
+  createTracer(config, api.logger)("aside", { channel, target, bot: aside.bot, ...(failure ? { failure } : {}) });
+  // 寫失敗一定要說：「沒記到卻也沒反應」就是把那句話默默弄丟了。
+  return { handled: true, ...(failure ? { text: asAside(`aside not recorded: ${failure}`) } : {}) };
+}
+
+/**
+ * 太長的訊息，平台會切成好幾則送（Discord 一則 2000 字、17 行），`/aside` 只在第一則的開頭。
+ * 所以一則長的 /aside 之後，同一個發話者在同一個房間幾秒內接著送來的，都算同一則的後半。
+ * 短的不會被切，不必等後半：人打完一句 /aside 緊接著講的話，是要給 AI 聽的。
+ */
+const ASIDE_TAIL_MS = 10_000;
+const maybeSplit = (text) => text.length >= 1200 || text.split("\n").length >= 12;
+const asideTails = new Map();
+
+function asideTail(ctx, body) {
+  if (!ctx?.senderId) return null;
+  const key = `${roomKey({ channel: ctx.channel, target: resolveRuntimeTarget(ctx) })}|${ctx.senderId}`;
+  const last = asideTails.get(key);
+  if (last === undefined) return null;
+  if (Date.now() - last.at > ASIDE_TAIL_MS) {
+    asideTails.delete(key);
+    return null;
+  }
+  return { text: body.trim(), bot: last.bot, tail: true };
 }
 
 async function runInterceptedRoute(api, event, ctx) {
@@ -298,6 +347,8 @@ async function runInterceptedRoute(api, event, ctx) {
     senderId: ctx?.senderId ?? "",
     sessionKey: ctx?.sessionKey ?? "",
     agentId: ctx?.agentId ?? "",
+    // 再送訊息用的 argv，後面接 `openclaw message send` 的選項；房間已經指定好了。
+    send: [process.execPath, SEND_SCRIPT, JSON.stringify(openclawOf(fiatConfigOf(config)?.openclaw)), channel, target],
   };
 
   // 只寫 project 的 route，要跑什麼是現在才推出來的。推不出來（script 還沒寫、
@@ -365,16 +416,27 @@ async function runInterceptedRoute(api, event, ctx) {
 const commandConfigOf = (api, ctx) => ctx?.config?.plugins?.entries?.[PLUGIN_ID]?.config ?? api.pluginConfig ?? {};
 
 /**
- * 指令是從哪個房間打的。算法要跟 hook 對得上，對照表的 key 才會是同一個。
- * `ctx.to` 是 `telegram:-100…` 這種帶 provider 的寫法，正規化之後就是 hook 看到的裸 id。
- * Discord 的斜線指令例外：`to` 是 `slash:<使用者 id>`（回覆給按指令的那個人），
- * 頻道要從 sessionKey 或 `from`（`discord:channel:<id>`）拿。
+ * 指令是從哪個房間打的。`target` 是送得到那個房間的寫法：只拿掉開頭的 provider
+ * （`telegram:-100…` → `-100…`），`user:`、`channel:` 這種種類一定要留著——Discord 的裸 id
+ * 是頻道，私聊少了 `user:` 就送不到。跟 hook 看到的寫法比對時，用 normalizeTarget 去掉種類再比。
+ * Discord 的斜線指令例外：`to` 是 `slash:<使用者 id>`（回覆給按指令的那個人），房間從 sessionKey 認。
  */
 function commandRoom(ctx) {
   const channel = lower(ctx?.channel);
-  const to = isSlashInteraction(ctx) ? "" : ctx?.to;
-  const raw = to || targetFromSessionKey(ctx?.sessionKey) || ctx?.from || "";
-  return { channel, target: normalizeTarget(raw, channel) };
+  const raw = isSlashInteraction(ctx) ? slashTarget(ctx) : ctx?.to || targetFromSessionKey(ctx?.sessionKey) || ctx?.from || "";
+  const target = String(raw).trim();
+  return { channel, target: lower(target.slice(0, channel.length + 1)) === `${channel}:` ? target.slice(channel.length + 1) : target };
+}
+
+/** Discord 斜線指令的房間：sessionKey 是 `…:discord:direct:<使用者 id>` 就是私聊，否則是頻道；沒有 sessionKey 才看 `from`。 */
+function slashTarget(ctx) {
+  const parts = String(ctx?.sessionKey ?? "").split(":");
+  const start = lower(parts[0]) === "agent" ? 2 : 0;
+  const kind = lower(parts[start + 1]);
+  const id = parts.slice(start + 2).join(":");
+  if (id && (kind === "direct" || kind === "dm")) return `user:${id}`;
+  if (id && kind === "channel") return `channel:${id}`;
+  return ctx?.from ?? "";
 }
 
 /** Discord 的斜線指令：`to` 是按指令的那個人，不是頻道。 */
@@ -386,6 +448,13 @@ const isSlashInteraction = (ctx) => /^slash:/i.test(ctx?.to ?? "");
 // 留一句話在房間裡，**但誰都不要處理它**。名字取自戲劇的「旁白」：說出口、留在
 // 劇本裡，但台上其他角色聽不見。它留在 offstage log 裡（`/tap` 撈得回來），
 // AI 與 script 都收不到，也不回話。每個房間的行為都一樣。
+//
+// 打成一則訊息的由 hook 記下（takeAside）；這裡接的是 OpenClaw 的原生指令（例如 Telegram 的指令選單）。
+// Discord 不註冊：那裡的斜線指令要先選一台機器人、只送到那一台，而 /aside 是房間的獨白，
+// 不綁哪一台。所以在 Discord 它就是一般文字，房間裡每一台的 hook 都記。
+
+/** 註冊 /aside 的 channel：設定裡 Discord 以外的。OpenClaw 沒有「不要註冊成原生指令」的開關，只有這張白名單。 */
+const asideChannels = (config) => Object.keys(config?.channels ?? {}).filter((channel) => lower(channel) !== "discord");
 
 function aside(api, ctx) {
   const room = commandRoom(ctx);
@@ -502,6 +571,7 @@ function parseFiat(args) {
 /**
  * 專案的 `.tap` 要指著這個房間：/tap 汲取的就是它指的那個房間。
  * 沒有就寫一份；指著別的房間（專案被裝到新房間來了）就改成這裡，timestamp 留著。
+ * 同一個房間但寫法不一樣（舊版把 `user:`、`channel:` 拿掉了）就補成送得到的寫法，不算換房間。
  */
 function ensureTap(dir, room) {
   const file = tapFileOf(dir);
@@ -509,7 +579,11 @@ function ensureTap(dir, room) {
     writeTap(join(dir, "genesis", ".tap"), room);
     return null;
   }
-  if (boundTo(readTap(file), room)) return null;
+  const tap = readTap(file);
+  if (boundTo(tap, room)) {
+    if (tap.target !== room.target) patchTap(file, { target: room.target });
+    return null;
+  }
   patchTap(file, { channel: room.channel, target: room.target });
   return file;
 }
@@ -614,7 +688,7 @@ const closers = new Set();
  * 所以先讓它講一會兒；`-q` 的十秒寬限之後還沒結束，就是被強制結束——該存的 commit、
  * memory、timestamp 在回報之前都存好了。gateway 在這之間重啟的話，`/fiat -done` 會直接關。
  */
-function closeSoon(settings, key, entry) {
+function closeSoon(settings, key, entry, room) {
   const closer = `${settings.projectsFile}|${key}|${entry.pid}`;
   if (closers.has(closer)) return;
   closers.add(closer);
@@ -624,7 +698,7 @@ function closeSoon(settings, key, entry) {
     const now = readIndex(settings.projectsFile)[key];
     if (!now?.closing || now.pid !== entry.pid) return; // 換人了，或已經被關掉
     const text = await close(settings, key, now);
-    if (!/is closed\.$/.test(text)) await notify(settings.openclaw, roomOf(key), text);
+    if (!/is closed\.$/.test(text)) await notify(settings.openclaw, room, text);
   }, grace).unref();
 }
 
@@ -822,7 +896,9 @@ async function receiveReport(api, req, res) {
   if (!entry?.pid || !samePath(entry.dir, dir)) {
     return answer(409, { error: "No /fiat round is open for this project in its room, so nothing was reported." });
   }
-  const text = await report(settings, key, entry, stage, String(request.message ?? "").trim());
+  // 回報送到專案的 .tap 寫的那個房間：對照表的 key 拿掉了 `user:` 這種種類，送不到 Discord 的私聊。
+  const to = { channel: String(room.channel), target: String(room.target) };
+  const text = await report(settings, key, entry, to, stage, String(request.message ?? "").trim());
   return answer(200, { text });
 }
 
@@ -851,8 +927,7 @@ const liveConfig = (api) => api.runtime?.config?.current?.()?.plugins?.entries?.
 /** Windows 上大小寫、斜線方向都不算數。 */
 const samePath = (a, b) => lower(resolve(String(a ?? ""))) === lower(resolve(String(b ?? "")));
 
-async function report(settings, key, entry, stage, message) {
-  const room = roomOf(key);
+async function report(settings, key, entry, room, stage, message) {
   const name = entry.name;
   const done = [];
   const lines = [];
@@ -892,11 +967,14 @@ async function report(settings, key, entry, stage, message) {
   if (entry.pid && stage === "done") {
     // pid 留著：那是關它的把手。
     patchRoom(settings.projectsFile, key, { closing: true, go: undefined });
-    closeSoon(settings, key, entry);
+    closeSoon(settings, key, entry, room);
     done.push("this session will be closed shortly");
   }
   return `${done.join("; ")}.`;
 }
+
+/** 指令的回覆也是這個 plugin 送出去的訊息：開頭帶記號。 */
+const asideReply = (result) => (typeof result?.text === "string" ? { ...result, text: asAside(result.text) } : result);
 
 export default definePluginEntry({
   id: PLUGIN_ID,
@@ -904,19 +982,24 @@ export default definePluginEntry({
   description: "Runs a per-room script before the agent replies; falls through to the AI when the script declines.",
   register(api) {
     api.on("before_dispatch", (event, ctx) => beforeDispatch(api, event, ctx), { priority: 100 });
-    api.registerCommand({
-      name: "aside",
-      description: "Leave a note here that neither the AI nor the room's script will see.",
-      acceptsArgs: true,
-      // 誰都可以留一句話；它什麼都不會觸發。
-      requireAuth: false,
-      handler: (ctx) => aside(api, ctx),
-    });
+    const channels = asideChannels(api.config);
+    // 一個都沒有的話（例如只接了 Discord）就不註冊：空的白名單在 OpenClaw 眼裡是「全部」。
+    if (channels.length) {
+      api.registerCommand({
+        name: "aside",
+        description: "Leave a note here that neither the AI nor the room's script will see.",
+        acceptsArgs: true,
+        channels,
+        // 誰都可以留一句話；它什麼都不會觸發。
+        requireAuth: false,
+        handler: async (ctx) => asideReply(await aside(api, ctx)),
+      });
+    }
     api.registerCommand({
       name: "fiat",
       description: "Start an AI coder on this room's project: /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go] [-claude|-codex]",
       acceptsArgs: true,
-      handler: (ctx) => fiat(api, ctx),
+      handler: async (ctx) => asideReply(await fiat(api, ctx)),
     });
     // 憑證由這個 plugin 自己驗（每一輪一個），不走 gateway 的登入。
     api.registerHttpRoute({

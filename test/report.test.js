@@ -19,6 +19,7 @@ import {
   seedSkill,
   serveRoute,
   tempDir,
+  unmark,
   waitFor,
 } from "./helpers.js";
 
@@ -92,7 +93,8 @@ const entry = () => readIndex()[KEY];
 /** 一輪開著的 session：房間綁著這個專案，叫起它的 harness 與 pid 都記著。 */
 const setEntry = (value) =>
   writeFileSync(projectsFile, JSON.stringify({ [KEY]: { name: "ledger", dir: project, harness: "claude", pid: 4242, ...value } }), "utf8");
-const messages = () => readJsonLines(notifyLog).map((argv) => argv[5]);
+/** 送進房間的每一則都是機器人的 /aside：驗過記號再拿掉。 */
+const messages = () => readJsonLines(notifyLog).map((argv) => unmark(argv[5]));
 const calls = (mode) => readJsonLines(runnerLog).filter((call) => call.mode === mode);
 /** 專案裡的 skill：`<專案>/ledger/SKILL.md` 與 `scripts/intercept.mjs`。 */
 const seedScript = () => seedSkill(project, "ledger");
@@ -116,6 +118,15 @@ it("posts into the room the project's .tap names", async () => {
   await report(["fiat", "FIAT-x.md"]);
   const [argv] = readJsonLines(notifyLog);
   assert.deepEqual(argv.slice(0, 5), ["--channel", "telegram", "--target", TELEGRAM_CHAT, "--message"]);
+});
+
+// 對照表的 key 拿掉了 `user:`：回報要照 .tap 的寫法送，Discord 的私聊才收得到。
+it("reports to the room as the .tap spells it, so a Discord DM gets it", async () => {
+  writeFileSync(join(project, "genesis", ".tap"), "channel:   discord\ntarget:    user:999999999999999999\ntimestamp:\n", "utf8");
+  writeFileSync(projectsFile, JSON.stringify({ "discord:999999999999999999": { name: "ledger", dir: project, harness: "claude", pid: 4242 } }), "utf8");
+  await report(["fiat", "FIAT-x.md"]);
+  const [argv] = readJsonLines(notifyLog);
+  assert.deepEqual(argv.slice(0, 4), ["--channel", "discord", "--target", "user:999999999999999999"]);
 });
 
 it("reads the message from stdin when it is -", async () => {

@@ -29,6 +29,8 @@ const prompt = [
   "```",
   "",
   "Conversation context (untrusted, recent messages):",
+  // 別台機器人只給人看的訊息：開頭帶著看不見的記號，AI 的 context 裡看得到原樣。
+  "#9  2026-09-20 09:59:00 GMT+8 Carol: \u{E0021}我做完了",
   "#10  2026-09-20 10:00:00 GMT+8 Alice: 自助餐120",
   "#11  2026-09-20 10:01:00 GMT+8 Alice: /aside 按鈕太小",
   "",
@@ -41,6 +43,9 @@ const offstage = [
   { at: "2026-09-20 10:01:01", kind: "aside", target: TELEGRAM_CHAT, text: "按鈕太小\n第二行" },
   { at: "2026-09-20 10:03:00", kind: "error", target: TELEGRAM_CHAT, text: "提款abc", reply: "ledger failed: bad amount" },
   { at: "2026-09-20 10:04:00", kind: "script", target: OTHER_CHAT, text: "別的房間", reply: "ok" },
+  // 機器人的 /aside：這一台的 hook 記下來的。
+  { at: "2026-09-20 09:59:01", kind: "aside", bot: true, target: TELEGRAM_CHAT, senderId: "9", text: "我做完了" },
+  { at: "2026-09-20 10:04:30", kind: "aside", bot: true, target: TELEGRAM_CHAT, senderId: "9", text: "ledger: FIAT ready" },
 ];
 
 before(() => {
@@ -96,9 +101,11 @@ const brief = (entries) => entries.map(({ ts, id, sender, text, kind, reply }) =
 describe("tap.mjs", () => {
   it("merges what the AI saw with what it never saw, from the .tap timestamp on", async () => {
     assert.deepEqual(brief(await timeline()), [
+      { ts: "2026-09-20 09:59:00", id: 9, sender: "Carol（機器人）", text: "我做完了", kind: "aside", reply: null },
       { ts: "2026-09-20 10:00:00", id: 10, sender: "Alice", text: "自助餐120", kind: "script", reply: "已記帳 外食費 120" },
       { ts: "2026-09-20 10:01:00", id: 11, sender: "Alice", text: "按鈕太小\n第二行", kind: "aside", reply: null },
       { ts: "2026-09-20 10:03:00", id: null, sender: "Alice", text: "提款abc", kind: "error", reply: "ledger failed: bad amount" },
+      { ts: "2026-09-20 10:04:30", id: null, sender: "9（機器人）", text: "ledger: FIAT ready", kind: "aside", reply: null },
       { ts: "2026-09-20 10:05:00", id: 12, sender: "Alice", text: "幫我查這個月的外食", kind: null, reply: null },
     ]);
   });
@@ -106,30 +113,33 @@ describe("tap.mjs", () => {
   it("lets --since move the start", async () => {
     const all = await timeline(["--since", "0"]);
     assert.equal(all[0].text, "昨天的");
-    assert.equal(all.length, 5);
+    assert.equal(all.length, 7);
     const late = await timeline(["--since", "2026-09-20 10:02"]);
     assert.deepEqual(
       late.map((entry) => entry.text),
-      ["提款abc", "幫我查這個月的外食"],
+      ["提款abc", "ledger: FIAT ready", "幫我查這個月的外食"],
     );
   });
 
   it("lists missing message ids as ranges, within the window only", async () => {
     const { coverage } = JSON.parse(await tap(["--format", "json"]));
-    assert.deepEqual(coverage.idRange, [10, 12]);
+    assert.deepEqual(coverage.idRange, [9, 12]);
     assert.equal(coverage.missing, 0);
     assert.deepEqual(coverage.missingIds, []);
   });
 
   it("counts what the AI never saw", async () => {
     const { summary } = JSON.parse(await tap(["--format", "json"]));
-    assert.deepEqual(summary, { messages: 4, offstage: 3, script: 1, error: 1, aside: 1 });
+    assert.deepEqual(summary, { messages: 6, offstage: 5, script: 1, error: 1, aside: 3 });
   });
 
   it("prints asides in full and marks each offstage line in the transcript", async () => {
     const text = await tap();
     assert.match(text, /^範圍：2026-09-20 00:00:00 起/m);
-    assert.match(text, /## \/aside（1 則）\n\n### 2026-09-20 10:01:00　Alice\n\n按鈕太小\n第二行\n/);
+    assert.match(
+      text,
+      /## \/aside（3 則）\n\n### 2026-09-20 09:59:00　Carol（機器人）\n\n我做完了\n\n### 2026-09-20 10:01:00　Alice\n\n按鈕太小\n第二行\n\n### 2026-09-20 10:04:30　9（機器人）\n\nledger: FIAT ready\n/,
+    );
     assert.match(text, /- 2026-09-20 10:00:00　#10 Alice：自助餐120\n  ↳ script 接走，回：已記帳 外食費 120\n/);
     assert.match(text, /- 2026-09-20 10:01:00　#11 Alice：\/aside 按鈕太小　…（全文見 \/aside 那節）\n  ↳ \/aside/);
     assert.match(text, /- 2026-09-20 10:03:00　Alice：提款abc\n  ↳ script 出錯，使用者看到：ledger failed: bad amount\n/);
@@ -211,5 +221,29 @@ describe("tap.mjs on the SQLite session store", () => {
     ]);
     assert.equal(coverage.files.sqliteSessions, 2);
     assert.equal(coverage.files.sqliteMessages, 3);
+  });
+});
+
+// .tap 的 target 帶著 `user:`、`channel:` 這種種類（送得到的寫法）：汲取照樣認得出是哪一間，舊版記下的裸 id 也算。
+describe("tap.mjs with a target that keeps its kind", () => {
+  it("reads a Discord DM whichever way its target was written", async () => {
+    const dmState = join(dir, "dm-state");
+    mkdirSync(join(dmState, "logs"), { recursive: true });
+    const line = (at, target, text) =>
+      `${at} ${JSON.stringify({ kind: "aside", channel: "discord", target, senderId: "999999999999999999", text })}`;
+    writeFileSync(
+      join(dmState, "logs", "chat-interceptor-offstage.log"),
+      `${line("2026-10-07 20:20:53", "user:999999999999999999", "帶 user: 的")}\n${line("2026-10-07 20:21:00", "999999999999999999", "舊版的裸 id")}\n`,
+      "utf8",
+    );
+    const out = await new Promise((resolve, reject) => {
+      execFile(
+        process.execPath,
+        [TAP, "--channel", "discord", "--target", "user:999999999999999999", "--since", "0", "--format", "json"],
+        { cwd: dir, encoding: "utf8", env: { ...process.env, OPENCLAW_STATE_DIR: dmState, TZ: "Asia/Taipei" } },
+        (error, stdout, stderr) => (error ? reject(new Error(stderr || error.message)) : resolve(stdout)),
+      );
+    });
+    assert.deepEqual(JSON.parse(out).timeline.map((entry) => entry.text), ["帶 user: 的", "舊版的裸 id"]);
   });
 });

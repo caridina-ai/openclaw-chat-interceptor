@@ -20,6 +20,7 @@ import {
   samePath,
   seedSkill,
   tempDir,
+  unmark,
   waitFor,
 } from "./helpers.js";
 
@@ -64,6 +65,19 @@ describe("registration", () => {
     assert.notEqual(commands.fiat.requireAuth, false);
     assert.equal(commands.fiat.acceptsArgs, true);
   });
+
+  // Discord 的斜線指令要先選一台機器人，回覆還會一會兒就消失。/aside 在那裡是一般文字，由 hook 記下。
+  it("keeps /aside off Discord, where it stays plain text", () => {
+    assert.deepEqual(commands.aside.channels, ["telegram"]);
+    assert.equal(commands.fiat.channels, undefined);
+  });
+
+  // 空的白名單在 OpenClaw 眼裡是「全部」。
+  it("does not register /aside at all when Discord is the only channel", () => {
+    const only = register({ config: { channels: { discord: {} } } }).commands;
+    assert.equal(only.aside, undefined);
+    assert.ok(only.fiat);
+  });
 });
 
 // 留一句話在房間裡，**但誰都不要處理它**：不叫 AI、不跑 script、不回話。
@@ -102,11 +116,12 @@ describe("/aside", () => {
     assert.equal(readOffstage(offstageLogFile)[0].target, OTHER_CHAT);
   });
 
-  it("files a Discord aside under the bare channel id, as the hook sees it", async () => {
-    await aside("hi", { channel: "discord", to: `channel:${DISCORD_CHAT}` });
+  // 房間的寫法要送得到：`user:`、`channel:` 這種種類留著，只拿掉開頭的 provider。
+  it("files a Discord aside under a target that can be sent to", async () => {
+    await aside("hi", { channel: "discord", to: `discord:channel:${DISCORD_CHAT}` });
     const [entry] = readOffstage(offstageLogFile);
     assert.equal(entry.channel, "discord");
-    assert.equal(entry.target, DISCORD_CHAT);
+    assert.equal(entry.target, `channel:${DISCORD_CHAT}`);
   });
 
   // Discord 的斜線指令：`to` 是按指令的那個人（`slash:<使用者 id>`），頻道在 sessionKey 與 `from`。
@@ -117,18 +132,29 @@ describe("/aside", () => {
       from: `discord:channel:${DISCORD_CHAT}`,
       sessionKey: `agent:main:discord:channel:${DISCORD_CHAT}`,
     });
-    assert.equal(readOffstage(offstageLogFile)[0].target, DISCORD_CHAT);
+    assert.equal(readOffstage(offstageLogFile)[0].target, `channel:${DISCORD_CHAT}`);
+  });
+
+  // 私聊的 `from` 是 `discord:<使用者 id>`，裸 id 在 Discord 是頻道：私聊要從 sessionKey 認成 `user:`。
+  it("files a Discord slash-command aside in a DM under user:", async () => {
+    await aside("hi", {
+      channel: "discord",
+      to: "slash:999999999999999999",
+      from: "discord:999999999999999999",
+      sessionKey: "agent:main:discord:direct:999999999999999999",
+    });
+    assert.equal(readOffstage(offstageLogFile)[0].target, "user:999999999999999999");
   });
 
   it("falls back to `from` for a Discord slash command without a channel session key", async () => {
     await aside("hi", { channel: "discord", to: "slash:999999999999999999", from: `discord:channel:${DISCORD_CHAT}` });
-    assert.equal(readOffstage(offstageLogFile)[0].target, DISCORD_CHAT);
+    assert.equal(readOffstage(offstageLogFile)[0].target, `channel:${DISCORD_CHAT}`);
   });
 
   it("tells the user when the aside could not be written", async () => {
     // The parent of this path is a regular file, so creating the directory fails.
     const result = await commands.aside.handler(commandCtx("nowhere", { config: { offstageLogFile: join(ECHO[1], "x.log") } }));
-    assert.match(result.text, /^aside not recorded: /);
+    assert.match(unmark(result.text), /^aside not recorded: /);
   });
 });
 
@@ -149,7 +175,8 @@ describe("/fiat", () => {
   });
   const fiat = (args, { config, ...overrides } = {}) =>
     commands.fiat.handler(commandCtx(args, { config: config ?? settings(), ...overrides }));
-  const reply = async (args, overrides) => (await fiat(args, overrides)).text;
+  /** /fiat 的回覆是給人看的，一律是機器人的 /aside。 */
+  const reply = async (args, overrides) => unmark((await fiat(args, overrides)).text);
 
   const readIndex = () => (existsSync(projectsFile) ? JSON.parse(readFileSync(projectsFile, "utf8")) : {});
   const entry = () => readIndex()[`telegram:${TELEGRAM_CHAT}`];
@@ -241,6 +268,32 @@ describe("/fiat", () => {
         assert.equal(calls("launch")[0].prompt, prompt);
       });
     }
+
+    // 私聊少了 `user:` 就送不到：.tap 寫的是送得到的寫法，回報就送去那裡。
+    const dm = {
+      channel: "discord",
+      to: "slash:999999999999999999",
+      from: "discord:999999999999999999",
+      sessionKey: "agent:main:discord:direct:999999999999999999",
+    };
+    const dmEntry = () => readIndex()["discord:999999999999999999"];
+
+    it("writes a Discord DM's .tap with user:", async () => {
+      await reply("ledger", dm);
+      await waitFor(() => dmEntry()?.pid, "the session");
+      assert.equal(
+        readFileSync(join(projects, "ledger", "genesis", ".tap"), "utf8"),
+        "channel:   discord\ntarget:    user:999999999999999999\ntimestamp:\n",
+      );
+    });
+
+    it("fills in what an old .tap left out, without moving the project", async () => {
+      const file = seed("ledger", "channel:   discord\ntarget:    999999999999999999\ntimestamp: 2026-09-01 10:00:00\n");
+      writeFileSync(projectsFile, JSON.stringify({ "discord:999999999999999999": { name: "ledger", dir: join(projects, "ledger") } }), "utf8");
+      await reply("", dm);
+      await waitFor(() => dmEntry()?.pid, "the session");
+      assert.equal(readFileSync(file, "utf8"), "channel:   discord\ntarget:    user:999999999999999999\ntimestamp: 2026-09-01 10:00:00\n");
+    });
 
     it("never writes the start time into .tap", async () => {
       await reply("ledger -t 2026-09-01 10:00");
@@ -342,7 +395,7 @@ describe("/fiat", () => {
       await reply("ledger");
       const [notify] = await waitFor(() => readJsonLines(notifyLog).length && readJsonLines(notifyLog), "the failure report");
       assert.deepEqual(notify.slice(0, 5), ["--channel", "telegram", "--target", TELEGRAM_CHAT, "--message"]);
-      assert.equal(notify[5], "fiat: could not start Claude Code for ledger: claude not found on PATH");
+      assert.equal(unmark(notify[5]), "fiat: could not start Claude Code for ledger: claude not found on PATH");
       assert.equal(entry().pid, undefined);
     });
 
@@ -503,7 +556,10 @@ describe("/fiat", () => {
       sessionKey: `telegram:group:${TELEGRAM_CHAT}`,
       pluginConfig: { ...settings(), routes: [] },
     });
-    const say = (body) => hook({ body, channel: "telegram" }, hookCtx());
+    const say = async (body) => {
+      const result = await hook({ body, channel: "telegram" }, hookCtx());
+      return result?.text ? { ...result, text: unmark(result.text) } : result;
+    };
 
     // 這是一個真實踩到的 bug 的回歸測試：回話說裝好了，但下一則訊息還是走舊的。
     it("takes effect on the very next message", async () => {

@@ -4,7 +4,7 @@
 
 - **攔截**：聊天訊息在交給 AI 之前，先給這個房間的 script 看。script 處理得了就直接回覆，
   **整輪不呼叫模型，0 token**；script 說「我不會」，訊息原封不動交給 AI。
-- **`/aside`**：在房間裡留一句話，AI 與 script 都看不到，只記下來。
+- **`/aside`**：在房間裡留一句話，AI 與 script 都看不到，只記下來。機器人也用它說只給人看的話。
 - **`/fiat`**：在房間裡叫起 Claude Code 或 Codex，把房間裡聊出來的點子做成 script，
   裝進房間讓你驗收。
 
@@ -81,6 +81,13 @@ openclaw gateway restart
 沒用到的那一個（例如只用 Codex 時的 `ccrun`）不必寫。`allowConversationAccess` 一定要留著，
 plugin 才會在 gateway 啟動時載入。**改過設定都要 `openclaw gateway restart`。**
 
+在 Discord 用 `/fiat` 的話，把斜線指令的回覆改成一般訊息——OpenClaw 預設是只有你看得到、
+過一會兒就消失的臨時訊息：
+
+```bash
+openclaw config set channels.discord.slashCommand.ephemeral false
+```
+
 ### 更新
 
 ```bash
@@ -94,7 +101,7 @@ script 是一支讀 stdin、印 stdout、用 exit code 表態的程式：
 
 | | |
 |---|---|
-| stdin | JSON `{ body, channel, target, senderId, sessionKey, agentId }`，`body` 是使用者原樣的輸入 |
+| stdin | JSON `{ body, channel, target, senderId, sessionKey, agentId, send }`，`body` 是使用者原樣的輸入，`send` 用來再送訊息 |
 | stdout | 回給使用者的純文字；空的就是「處理掉但不回話」 |
 | exit `0` | 處理掉了，不呼叫模型 |
 | exit `20` | 我不會，交給 AI |
@@ -145,12 +152,22 @@ script 有兩種方式接上房間：
 
 ## `/aside`
 
+在房間裡留一句話，但不要任何人處理它：不呼叫 AI、不送進 script、不回話，只記下來。
+之後 `/fiat` 汲取對話時，這些話會被特別列出來——適合隨手記下「這裡用起來不順」。房間裡誰都能用：
+
 ```
 /aside 按鍵盤之後要等好幾秒才有反應
 ```
 
-不呼叫 AI、不送進 script、不回話，只記下來。房間裡誰都能用。之後 `/fiat` 汲取對話時，
-這些話會被特別列出來——適合隨手記下「這裡用起來不順」。
+它是房間的獨白，不是對哪一台機器人說的：房間裡每一台裝了這個 plugin 的機器都會記下來。
+在 Discord 上它不是斜線指令，就是一般文字（房間要求 @mention 的話，要 @ 機器人才收得到）。
+
+**機器人也用 `/aside`。** 好幾台機器人在同一個 Discord 房間裡互相看得到（`allowBots`）時，
+`/aside` 開頭的訊息，其他機器人只記下來、不回應：
+
+- AI 只給人看的回覆會以 `/aside` 開頭：plugin 附的 `group-aside` 技能會教 AI 在群聊裡這麼做。
+  看到 `/aside`，就知道其他機器人不會接話。
+- 這個 plugin 送出的每一則（`/fiat` 的回覆與回報、script 的回話）也一樣，只是畫面上看不到 `/aside`。
 
 ## `/fiat`
 
@@ -182,6 +199,7 @@ script 有兩種方式接上房間：
 
 - **一個房間一個專案。** 要換就 `/fiat -uninstall` 再 `/fiat -install <別的專案>`。
 - **一個房間一次一個 AI。** 開著的時候再打 `/fiat` 會被擋下來。
+- 房間裡有好幾台機器人時，Discord 上打 `/fiat` 要從選單選一台：選哪一台，就由那台機器來開發。
 - **一個專案就是一個 OpenClaw skill**：`SKILL.md` 教 AI 處理 script 放行的輸入，
   `scripts/intercept.*` 攔下確定性的那些。安裝是複製一份進這個房間的 agent，
   之後開發目錄怎麼改都不影響線上，直到再 `-install` 一次。

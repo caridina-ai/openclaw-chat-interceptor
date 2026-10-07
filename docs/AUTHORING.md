@@ -21,12 +21,14 @@
   "target": "-1001234567890",
   "senderId": "11111111",
   "sessionKey": "agent:my-agent:telegram:group:-1001234567890",
-  "agentId": "my-agent"
+  "agentId": "my-agent",
+  "send": ["…"]
 }
 ```
 
 - `body` 是使用者**原樣**的輸入，沒有任何清理。全形半形、空白、標點都由你決定怎麼處理。
-- 除了 `body` 以外都可能是空字串。
+- 除了 `body` 與 `send` 以外都可能是空字串。
+- `send` 是再送訊息用的，見第 7 節。
 - `/` 開頭的訊息（斜線指令）永遠不會送到你手上，不要拿 `/` 開頭的字當觸發詞。
 - stdout 只放給使用者看的字。debug、進度、警告一律寫 stderr。
 
@@ -109,15 +111,22 @@ openclaw infer model run --gateway --json --prompt "<很窄的問題>"
 
 ## 7. 按鈕、圖片、多則訊息
 
-stdout 只能是一則純文字。要更多就自己送，**送完 stdout 留空**再 exit 0，否則使用者會多收到一則：
+stdout 只能是一則純文字。要更多就用 stdin 給的 `send` 自己送：它是一串 argv，後面接
+`openclaw message send` 的選項（`--message`、`--presentation`、`--media`…），房間已經指定好了。
+**送完 stdout 留空**再 exit 0，否則使用者會多收到一則。
 
-```bash
-openclaw message send --channel <channel> --target <target> --message "要哪一筆？" \
-  --presentation '{"buttons":[{"text":"#18 七月水費","value":"18"}]}'
-openclaw message send --channel <channel> --target <target> --media ./chart.png
+```js
+import { execFileSync } from "node:child_process";
+const [command, ...args] = payload.send;
+execFileSync(command, [...args, "--message", "要哪一筆？", "--presentation", JSON.stringify({ buttons: [{ text: "#18 七月水費", value: "18" }] })]);
+execFileSync(command, [...args, "--media", "./chart.png"]);
 ```
 
-`channel`、`target` 直接用 stdin 給的。
+```python
+subprocess.run([*payload["send"], "--message", "要哪一筆？"], check=True)
+```
+
+不要直接呼叫 `openclaw message send`：用 `send` 送的，房間裡其他機器人才不會接話。
 
 ## 8. 陷阱
 

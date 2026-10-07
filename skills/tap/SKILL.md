@@ -26,7 +26,7 @@ node <這份 SKILL.md 所在的目錄>/report.mjs <fiat|built|done> "<給主述�
 
    - 房間讀 `genesis/.tap`（`channel` / `target` / `timestamp`）。`timestamp` 是上一輪結束的時間，汲取從那裡開始；空的就是從頭。
    - `/tap` 後面帶了時間，就用 `--since` 把起點改成那個時間。
-   - 輸出依序是：`/aside`（使用者特地留下的話，整段列出）；逐字稿，每一則是 `時間　#id 發話者：內容`，AI 沒看到的那些底下有一行 `↳` 說明下場（script 接走、script 出錯、/aside）；最後是涵蓋範圍（缺了哪些 message id）。太長就用 `--since` 分段讀。
+   - 輸出依序是：`/aside`（房間裡特地留下、誰都不處理的話，整段列出；標著「機器人」的是其他機器人只給人看的訊息）；逐字稿，每一則是 `時間　#id 發話者：內容`，AI 沒看到的那些底下有一行 `↳` 說明下場（script 接走、script 出錯、/aside）；最後是涵蓋範圍（缺了哪些 message id）。太長就用 `--since` 分段讀。
 
 3. **判斷這次要做的範圍**，濃縮成一行描述，當 FIAT 文件的標題（`# ` 那一行）。
 
@@ -50,7 +50,7 @@ node <這份 SKILL.md 所在的目錄>/report.mjs <fiat|built|done> "<給主述�
 - 做完先不要 commit。
 - 成果是一個 OpenClaw skill，放在專案裡的 `<skill 名>/`（新專案就用專案名）。回報之後它會自動上線到這個房間，主述者直接在房間裡驗收；不必寫設定檔，也不要動 gateway 的設定。
   - `SKILL.md`：教 AI 處理 script 放行的那些輸入。
-  - `scripts/intercept.{mjs,js,cjs,py}`：攔截 script。stdin 收 JSON `{ body, channel, target, senderId, sessionKey, agentId }`；stdout 是回給使用者的純文字，空的就是不回話；exit `0` 處理掉、exit `20` 交給 AI、其他是出錯。
+  - `scripts/intercept.{mjs,js,cjs,py}`：攔截 script。stdin 收 JSON `{ body, channel, target, senderId, sessionKey, agentId, send }`（`send` 用來再送訊息）；stdout 是回給使用者的純文字，空的就是不回話；exit `0` 處理掉、exit `20` 交給 AI、其他是出錯。
   - 有副作用的動作一旦做了，就不可以 exit `20`：AI 會拿同一句話再做一次。
   - `.py` 是用 `uv run` 跑的，依賴寫在開頭的 PEP 723 `# /// script` 區塊。
   - 細節見 [AUTHORING.md](https://github.com/caridina-ai/openclaw-chat-interceptor/blob/main/docs/AUTHORING.md)。

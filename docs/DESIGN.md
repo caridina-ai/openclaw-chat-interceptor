@@ -50,7 +50,8 @@ executeDispatch → getReply()   ← 處理斜線指令、把這句話寫進 ses
 
 **斜線指令也會先經過這裡**，因為指令是在 `getReply()` 裡才處理的。所以 plugin 看到
 `/` 開頭的訊息一律放行、不送 script——否則回覆所有訊息的 script 會把 `/new`、
-`/status` 吃掉。`/aside`、`/fiat` 在 telegram 是原生指令，走另一條路，碰不到這個 hook。
+`/status` 吃掉。唯一的例外是打成一則訊息的 `/aside`：在這裡就記下（見 2.7）。
+`/aside`、`/fiat` 在 telegram 是原生指令，走另一條路，碰不到這個 hook。
 
 ### 為什麼不是 `before_agent_reply`
 
@@ -137,12 +138,14 @@ openclaw-chat-interceptor/
 ├── openclaw.plugin.json        # plugin manifest：id / activation / configSchema
 ├── src/
 │   ├── index.js                # hook 與兩個 slash command（plain ESM，沒有 build step）
-│   └── core.js                 # 機械部分：房間、對照表、.tap、script、ccrun／cdrun
+│   ├── core.js                 # 機械部分：房間、對照表、.tap、script、ccrun／cdrun
+│   └── send.mjs                # script 再送訊息用的（payload 的 `send`，見 2.7）
 ├── test/*.test.js              # node --test，不需要 gateway、Claude Code 或 Codex
 ├── skills/tap/                 # /tap：給 Claude Code 或 Codex 裝的技能（見 2.8）
 │   ├── SKILL.md
 │   ├── tap.mjs                 # 汲取對話
 │   └── report.mjs              # 回報程式：每一段結束時呼叫（見 2.9）
+├── skills/group-aside/         # OpenClaw 技能，隨 plugin 載入：群聊裡怎麼說只給人看的話（見 2.7）
 ├── genesis/                    # 本專案的委託書：FIATLUX.md 與後續的 FIAT-*.md
 └── docs/
     ├── AUTHORING.md            # 給 script 作者
@@ -163,6 +166,8 @@ script 專案（見 AUTHORING.md）。測試用的是寫進暫存目錄的 fixtu
 plugin 本身**不含任何領域邏輯**，只做路由：
 
 ```
+asideOf(body)                   /aside 或帶記號的 → 記進 offstage log，{ handled: true }（見 2.7）
+  ↓ 不是
 selectRoute(ctx, config)        設定裡的 route 優先，其次是對照表裡裝上的專案
   ↓ 沒有 route → return undefined（整輪給 AI）
 spawn route.command，stdin 餵 JSON payload
@@ -172,8 +177,10 @@ exit 20 → return undefined（給 AI）
 其他    → 依 route.onError 決定 handled（記進 offstage log）或 passthrough
 ```
 
-`/aside` 與 `/fiat` 不在這條路上：它們是 OpenClaw 的 slash command（見 2.7、2.9），
-在 agent 之前就被 OpenClaw 的指令流程接走了，根本不會走到這個 hook。
+回話的 `text` 開頭帶記號（見 2.7）：給人看的，其他機器人不接話。
+
+`/fiat` 不在這條路上：它是 OpenClaw 的 slash command（見 2.9），在 agent 之前就被
+OpenClaw 的指令流程接走了，根本不會走到這個 hook。
 
 六個刻意的設計決定：
 
@@ -205,7 +212,7 @@ exit 20 → return undefined（給 AI）
 | | |
 |---|---|
 | 位置 | `<projectsDir>/<project>/scripts/intercept.{mjs,js,cjs,py}`（用 `project` route 時） |
-| stdin | JSON `{ body, channel, target, senderId, sessionKey, agentId }` |
+| stdin | JSON `{ body, channel, target, senderId, sessionKey, agentId, send }` |
 | stdout | 要回給使用者的純文字；空的代表「處理掉但不回話」 |
 | exit `0` | 處理掉了 |
 | exit `20` | 我不會，請交給 AI |
@@ -301,9 +308,12 @@ openclaw plugins inspect openclaw-chat-interceptor --runtime --json
 
 ### 2.7 `/aside`
 
-`/aside ＿＿` 是 plugin 用 `api.registerCommand()` 註冊的 OpenClaw slash command：
-不呼叫模型、不跑 script、不回話（`{ suppressReply: true }`），只往 offstage log
-append 一行 `<當地時間> {"kind":"aside", …}`。
+`/aside ＿＿`：不呼叫模型、不跑 script、不回話，只往 offstage log
+append 一行 `<當地時間> {"kind":"aside", …}`。兩個入口：
+
+- **OpenClaw 的原生指令**（例如 Telegram 的指令選單）：`api.registerCommand()` 的 handler，
+  回 `{ suppressReply: true }`。
+- **打成一則訊息的**：hook 在選 route 之前就記下（`takeAside`）。
 
 幾個刻意的決定：
 
@@ -311,9 +321,15 @@ append 一行 `<當地時間> {"kind":"aside", …}`。
   這就是定義。它曾經叫 `ISSUE`，但那個名字宣稱了「這是軟體的問題」，
   而使用者留的話多半不是；他只是不想讓那句話被任何人處理。
 
-- **是 slash command，不是 hook 裡的字串比對。** 它本來就一定不會叫 AI，沒有理由走
-  「先攔、再判斷」那條路。掛成指令之後 OpenClaw 自己處理 `/aside@botname`、
-  Telegram 的指令選單也看得到它。
+- **它是房間的獨白，不是對哪一台說的。** 留話的人不會想到將來是哪一台來實作，
+  所以房間裡每一台都要記：打成一則訊息的 `/aside`（帶不帶 `@bot` 都一樣），每一台的 hook 都收得到。
+
+- **Discord 上不註冊成原生指令。** 那裡的斜線指令要先選一台機器人、只送到那一台，
+  頻道裡也不會留下打的字（`suppressReply` 就是沒有可見的回覆）。不註冊的話，
+  Discord 用戶端把 `/aside` 當成一般文字送出。OpenClaw 沒有「不要註冊成原生指令」的開關，
+  唯一的把手是 `registerCommand` 的 `channels`——一張白名單，原生指令與文字指令都看它——
+  所以列的是設定裡 Discord 以外的 channel；一個都沒有就不註冊，空的白名單在 OpenClaw 眼裡是「全部」。
+  其他 channel 照舊走原生指令的 handler。
 
 - **每個房間的行為都一樣，而且誰都能用**（`requireAuth: false`）。有沒有 route、
   有沒有專案，都不影響。使用者要的是「我在這裡留一句，誰都不要理」；這件事如果在
@@ -324,6 +340,31 @@ append 一行 `<當地時間> {"kind":"aside", …}`。
 
 - **寫失敗要回話。** 使用者要的是「記一下、不要有反應」，但「沒記到卻也沒反應」
   就是把他的話默默弄丟了，所以那一則回 `aside not recorded: …`。
+
+#### 機器人的 /aside
+
+好幾台機器人在同一個房間裡互相看得到（Discord 的 `allowBots: true`、不要求 @mention）時，
+一台的回報會被另一台的 AI 拿來回應，一來一往就把額度燒光。所以只給人看、不需要其他機器人接話的訊息，
+也用 /aside。hook 認兩種開頭，處理完全一樣：
+
+- **`/aside`**：人打的，或 AI 自己寫的。教 AI 這麼做的是隨 plugin 載入的 OpenClaw 技能 `skills/group-aside`
+  （manifest 的 `skills`；`user-invocable: false`，不會變成斜線指令）。送出去不做任何轉換：
+  人看得到 `/aside`，就知道其他機器人看不到。
+- **一個看不見的記號 U+E0021**（TAG EXCLAMATION MARK）：這個 plugin 自己送出去的每一則都帶，畫面上乾淨。
+  出口有三個：`core.js` 的 `notify`（回報、失敗通知）、hook 與指令回給 OpenClaw 的 `text`
+  （script 的回話與錯誤訊息、`/fiat` 的回覆），以及 script 要再送訊息時叫的 `src/send.mjs`（payload 的 `send`）。
+  記號的寬度是零，Telegram 與 Discord 都原樣保留、顯示時看不出來，別台 bot 的訊息進到這一台的 `before_dispatch` 時
+  也還在（都實測過）。記下來時標 `"bot": true`，`/tap` 在發話者後面標「機器人」。
+
+幾個刻意的決定：
+
+- **記號不寫進 AUTHORING。** script 作者只學 `send`：記號只有一個地方會加，換了也只改一處。
+  回報本來就經過 gateway，加記號不靠 AI 記得。
+
+- **長訊息的後半也算。** 平台會把太長的訊息切成好幾則（Discord 一則 2000 字、17 行），`/aside` 或記號
+  只在第一則。所以一則長的 /aside（1200 字或 12 行以上，可能被切過）之後，同一個發話者在同一個房間
+  10 秒內接著送來的，都算同一則的後半（每接一則再延 10 秒）。短的不會被切，不必等：人打完一句 /aside
+  緊接著講的話，是要給 AI 聽的。hook 分不出發話者是人還是 bot，所以只能看長度。
 
 ### 2.8 `/tap`：被攔掉的輸入怎麼還原
 
@@ -339,7 +380,7 @@ append 一行 `<當地時間> {"kind":"aside", …}`。
 | 1 | `<sessionId>.trajectory.jsonl` 的 prompt | `Conversation info` 的 message id 與發話者，以及 `Conversation context` 那幾行「AI 沒被叫醒也看得到的鄰近訊息」 |
 | 2 | `<sessionId>.jsonl`（含 `.reset.`／`.deleted.`） | 乾淨的 `role:user` 原文，但沒有 message id |
 | 3 | `agent/codex-home/sessions/**/rollout-*.jsonl` | runtime 的另一份副本，補 1 已被輪替掉的部分 |
-| 4 | offstage log | AI 沒看到的那些：script 接走、script 出錯、`/aside` |
+| 4 | offstage log | AI 沒看到的那些：script 接走、script 出錯、`/aside`（帶記號的，發話者標著「機器人」） |
 | 5 | `agent/openclaw-agent.sqlite`（OpenClaw 2026.9 起） | session 全搬進這裡，1、2 從此不再長大。`transcript_events` 的使用者發言直接帶 message id 與發話者；一部分 event 是 zstd 壓縮存的；被換掉的 session 封存在 `session_transcript_archives`。唯讀開啟，gateway 正開著它 |
 
 1～3 都會有缺漏（session 輪替、context window 裁切），合併後才接近完整。
@@ -484,9 +525,18 @@ plugin 註冊的 HTTP 路由 `/chat-interceptor/report`，其餘的事都在 gat
 - **`allowFrom` 疊在 OpenClaw 自己的指令授權上。** `/fiat` 會在這台機器上叫起一個能改檔案的
   agent；OpenClaw 認可的 sender 不一定都該有這個權力。
 
+- **Discord 上 `/fiat` 維持斜線指令。** 房間裡有好幾台機器人時，從選單選一台，就是指定由哪一台開發；
+  打成一般文字的話每一台都收得到，會一起叫起 AI。OpenClaw 的斜線指令回覆預設是臨時訊息
+  （`channels.discord.slashCommand.ephemeral` 預設 true），只有下指令的人看得到、過一會兒就消失，
+  所以 README 請 Discord 使用者把它設成 false。
+
+- **房間的寫法要送得到。** `.tap`、offstage log 記的 target 只拿掉開頭的 provider，`user:`、`channel:` 這種種類留著：
+  Discord 的裸 id 是頻道，私聊少了 `user:` 就送不到。回報送到 `.tap` 寫的那個房間；對照表的 key 是正規化過的，
+  只拿來找，不拿來送。比對兩種寫法是不是同一間，一律用 `normalizeTarget` 去掉種類再比，舊的寫法也認得。
+
 - **Discord 的斜線指令，`ctx.to` 是 `slash:<使用者 id>`**（回覆給按指令的那個人），
-  不是頻道。房間改從 sessionKey 或 `from`（`discord:channel:<id>`）認，否則 `/fiat`
-  會把「這個人」當成房間。
+  不是頻道。房間改從 sessionKey 認（`…:discord:direct:<id>` 是私聊 `user:<id>`，其他是 `channel:<id>`），
+  沒有才看 `from`，否則 `/fiat` 會把「這個人」當成房間。私聊的 `from` 是 `discord:<使用者 id>`，不能拿來用。
 
 ---
 
@@ -502,7 +552,8 @@ script 需要更多能力時，OpenClaw CLI 本身就是它的介面，plugin �
 | script 想做 | 它自己怎麼做 |
 |---|---|
 | 中途問模型（含 model routing 與 fallback） | `openclaw infer model run --gateway --json` |
-| 按鈕、選單、圖片、多則訊息、就地更新 | `openclaw message send`／`edit`（`--presentation`、`--media`…） |
+| 按鈕、選單、圖片、多則訊息 | stdin 給的 `send`，後面接 `openclaw message send` 的選項（`--presentation`、`--media`…） |
+| 就地更新 | `openclaw message edit` |
 | 來回兩輪的流程狀態 | 用 stdin 給的 `sessionKey` 當 key 自己寫狀態檔 |
 | 同一個房間內依關鍵字分流 | 一支 script，內部自己 dispatch |
 

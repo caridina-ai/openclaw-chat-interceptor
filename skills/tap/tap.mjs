@@ -24,7 +24,7 @@
 //
 //   offstage log（AI 沒看到的）
 //     4. chat-interceptor-offstage.log
-//        → script 接走的、script 出錯的、/aside。plugin 一直開著在記。
+//        → script 接走的、script 出錯的、/aside（人打的，或其他機器人只給人看的訊息）。plugin 一直開著在記。
 //
 // session 來源都會有缺漏（session 輪替、context window 裁切），合併後才接近完整；
 // 輸出最後的「涵蓋範圍」會說還缺哪些 message id。
@@ -390,6 +390,7 @@ let offstageFound = false;
       text: String(data.text ?? ""),
       reply: data.reply ?? null,
       senderId: data.senderId ? String(data.senderId) : null,
+      bot: data.bot === true,
     });
   }
 }
@@ -403,7 +404,9 @@ let offstageFound = false;
 //（session 記的是 telegram 收訊時間，offstage 記的是 hook 跑起來的時間，差幾秒是正常的）。
 const MATCH_WINDOW_MS = 5 * 60 * 1000;
 const firstLine = (text) => String(text ?? "").split("\n")[0].trim();
-const stripAside = (text) => String(text ?? "").replace(/^\/aside(?:@\S+)?(?![\w-])/i, "").trim();
+// 機器人的 /aside 開頭是一個看不見的記號（U+E0021），session 裡看到的那一則會帶著它。
+const stripAside = (text) => String(text ?? "").replace(/^(?:\u{E0021}|\/aside(?:@\S+)?(?![\w-]))/iu, "").trim();
+const botLabel = (name) => `${name ?? "?"}（機器人）`;
 
 const messages = [
   ...[...byId.values()].map((m) => ({ ...m, source: "session" })),
@@ -442,10 +445,12 @@ function findSame(candidates, ts, text, pick) {
 const timeline = [...merged];
 for (const entry of offstage) {
   const pick = entry.kind === "aside" ? stripAside : (text) => text;
-  const sender = entry.senderId ? (senderNames.get(entry.senderId) ?? entry.senderId) : null;
+  const name = entry.senderId ? (senderNames.get(entry.senderId) ?? entry.senderId) : null;
+  const sender = entry.bot ? botLabel(name) : name;
   const message = findSame(merged, entry.ts, entry.text, pick);
   if (message) {
     Object.assign(message, { kind: entry.kind, reply: entry.reply, text: entry.kind === "aside" ? entry.text : message.text });
+    if (entry.bot) message.sender = botLabel(message.sender);
   } else {
     timeline.push({ ts: entry.ts, id: null, sender, text: entry.text, kind: entry.kind, reply: entry.reply, source: "offstage" });
   }
@@ -540,7 +545,7 @@ console.log(
     `（script 接走 ${summary.script}、script 出錯 ${summary.error}、/aside ${summary.aside}）`,
 );
 
-// ---- /aside：使用者特地留下、誰都不處理的話 ----
+// ---- /aside：房間裡特地留下、誰都不處理的話 ----
 if (asides.length) {
   console.log("");
   console.log(`## /aside（${asides.length} 則）`);

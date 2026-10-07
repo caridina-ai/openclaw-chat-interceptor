@@ -65,14 +65,11 @@ export function normalizeTarget(value, ...providers) {
   }
 }
 
-/** 一個房間一個 key。target 先正規化，`-100…` 與 `telegram:group:-100…` 是同一間。 */
+/**
+ * 一個房間一個 key。target 先正規化，`-100…` 與 `telegram:group:-100…` 是同一間。
+ * key 只拿來找對照表，不拿來送訊息：它拿掉了 `user:` 這種種類，Discord 的私聊就送不到了。
+ */
 export const roomKey = (room) => `${lower(room.channel)}:${normalizeTarget(room.target, room.channel)}`;
-
-/** roomKey 的反向：key 本身就夠 `openclaw message send` 用，不必另外記房間位置。 */
-export function roomOf(key) {
-  const separator = String(key).indexOf(":");
-  return { channel: key.slice(0, separator), target: key.slice(separator + 1) };
-}
 
 // ---------------------------------------------------------------------------
 // 房間 → 專案的對照表
@@ -330,9 +327,34 @@ export function run([command, ...args], extra = [], { timeout = 60_000, env } = 
   });
 }
 
-const openclawOf = (openclaw) => (openclaw?.length ? openclaw : DEFAULT_OPENCLAW);
+export const openclawOf = (openclaw) => (openclaw?.length ? openclaw : DEFAULT_OPENCLAW);
 
-/** 對房間講一句話。走 `openclaw message send`，跟 script 想額外送訊息時同一條路。 */
+// ---------------------------------------------------------------------------
+// /aside：給人看、誰都不處理的訊息
+// ---------------------------------------------------------------------------
+// 好幾個機器人在同一個房間裡互相看得到（Discord 的 allowBots）時，一台的回報會被另一台的 AI
+// 拿來回應，一來一往就把額度燒光。所以 `/aside` 開頭的訊息，每一台的 hook 都記進 offstage log、
+// 不交給 AI——人打的、AI 寫的都一樣。這個 plugin 自己送出去的訊息也是這樣處理，只是 `/aside`
+// 換成一個看不見的記號：畫面上乾淨，其他機器人照樣不接話。
+
+/** U+E0021 TAG EXCLAMATION MARK：寬度是零，Telegram 與 Discord 都原樣保留，顯示時看不出來。 */
+export const ASIDE_MARK = "\u{E0021}";
+
+/** 這個 plugin 送出去的訊息：開頭帶記號。 */
+export const asAside = (text) => (String(text).startsWith(ASIDE_MARK) ? String(text) : `${ASIDE_MARK}${text}`);
+
+/**
+ * 這則訊息是不是 /aside：`/aside …`（可以帶 `@bot`），或開頭帶記號的（這個 plugin 送的）。
+ * 是就回傳 `{ text, bot }`，`text` 是後面那段話，`bot` 是帶記號的那種；不是就回 null。
+ */
+export function asideOf(body) {
+  const text = String(body ?? "").trimStart();
+  if (text.startsWith(ASIDE_MARK)) return { text: text.slice(ASIDE_MARK.length).trim(), bot: true };
+  const typed = /^\/aside(?:@\S+)?(?:\s+|$)/i.exec(text);
+  return typed ? { text: text.slice(typed[0].length).trim(), bot: false } : null;
+}
+
+/** 對房間講一句話。走 `openclaw message send`，跟 script 想額外送訊息時同一條路。這個 plugin 講的一律是 /aside。 */
 export const notify = (openclaw, room, text) =>
   run([...openclawOf(openclaw), "message", "send"], [
     "--channel",
@@ -340,7 +362,7 @@ export const notify = (openclaw, room, text) =>
     "--target",
     room.target,
     "--message",
-    text,
+    asAside(text),
   ]);
 
 /**

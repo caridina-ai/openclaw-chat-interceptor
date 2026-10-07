@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ASIDE_MARK } from "../src/core.js";
 import entry from "../src/index.js";
 
 export const PLUGIN_ID = "openclaw-chat-interceptor";
@@ -41,19 +42,21 @@ export function fixture(dir, name, source) {
 
 /**
  * 把 plugin 註冊到一個假的 api 上，拿回 hook、兩個指令與 HTTP 路由。
+ * `config` 是 OpenClaw 啟動時的整份設定（/aside 從它認有哪些 channel）；
  * `runtimeConfig` 是 gateway 當下那一份設定（回報路由從那裡取），測試可以隨時換掉它。
  */
-export function register() {
+export function register({ config = { channels: { telegram: {}, discord: {} } } } = {}) {
   const commands = {};
   const routes = {};
-  let hook;
+  const hooks = {};
   const api = {
+    config,
     pluginConfig: {},
     runtimeConfig: {},
     runtime: { config: { current: () => api.runtimeConfig } },
     logger: { info() {}, warn() {}, error() {} },
     on(name, handler) {
-      if (name === "before_dispatch") hook = handler;
+      hooks[name] = handler;
     },
     registerCommand(definition) {
       commands[definition.name] = definition;
@@ -63,8 +66,15 @@ export function register() {
     },
   };
   entry.register(api);
-  assert.ok(hook, "before_dispatch handler was not registered");
-  return { hook, commands, routes, api };
+  assert.ok(hooks.before_dispatch, "before_dispatch handler was not registered");
+  assert.deepEqual(Object.keys(hooks), ["before_dispatch"]);
+  return { hook: hooks.before_dispatch, commands, routes, api };
+}
+
+/** 這個 plugin 送出去的每一則開頭都帶記號：驗過再拿掉，其餘的測試只看內容。 */
+export function unmark(text) {
+  assert.ok(String(text).startsWith(ASIDE_MARK), `not marked as an aside: ${JSON.stringify(text)}`);
+  return text.slice(ASIDE_MARK.length);
 }
 
 /** 把一條 plugin 的 HTTP 路由掛在本機的隨機 port 上，回傳它的網址與關掉它的方法。 */
