@@ -2,6 +2,7 @@
 // 回報程式：/tap 每一段的最後呼叫它。
 //
 //   node report.mjs fiat  "<一段話>"   FIAT 文件寫好了
+//   node report.mjs empty "<一段話>"   這一輪沒寫成 FIAT 文件
 //   node report.mjs built "<一段話>"   實作完成
 //   node report.mjs done  "<一段話>"   commit 了、交接 memory 也寫了
 //
@@ -14,11 +15,10 @@
 // 也不開子行程、不寫檔：Codex 的 sandbox 兩樣都不准，連回本機 gateway 倒是可以。
 
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { gatewayUrl } from "./gateway.mjs";
 
-const STAGES = ["fiat", "built", "done"];
-const DEFAULT_GATEWAY_PORT = 18789;
+const STAGES = ["fiat", "empty", "built", "done"];
 
 const [stage, ...rest] = process.argv.slice(2);
 if (!STAGES.includes(stage)) {
@@ -40,7 +40,7 @@ if (!room.channel || !room.target) {
   process.exit(0);
 }
 
-const url = `http://127.0.0.1:${gatewayPort()}/chat-interceptor/report`;
+const url = gatewayUrl("/chat-interceptor/report");
 const body = JSON.stringify({ room, dir: process.cwd(), stage, message });
 
 // gateway 重啟要一分鐘上下：連不上就等它回來。
@@ -68,24 +68,4 @@ for (;;) {
   }
   console.log(answer.text);
   process.exit(0);
-}
-
-/** OpenClaw 自己找 gateway 的順序：環境變數、設定檔的 gateway.port、預設值。 */
-function gatewayPort() {
-  if (Number(process.env.OPENCLAW_GATEWAY_PORT)) return Number(process.env.OPENCLAW_GATEWAY_PORT);
-  const config =
-    process.env.OPENCLAW_CONFIG_PATH || join(process.env.OPENCLAW_STATE_DIR || join(homedir(), ".openclaw"), "openclaw.json");
-  let text;
-  try {
-    text = readFileSync(config, "utf8");
-  } catch {
-    return DEFAULT_GATEWAY_PORT;
-  }
-  try {
-    return Number(JSON.parse(text)?.gateway?.port) || DEFAULT_GATEWAY_PORT;
-  } catch {
-    // 手寫的 JSON5（註解、尾逗號）：退一步找 gateway 那一段的 port。
-    const gateway = text.slice(Math.max(0, text.search(/["']?gateway["']?\s*:/)));
-    return Number(/["']?port["']?\s*:\s*(\d+)/.exec(gateway)?.[1]) || DEFAULT_GATEWAY_PORT;
-  }
 }

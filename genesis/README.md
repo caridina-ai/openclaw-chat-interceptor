@@ -5,3 +5,4 @@
 3. [在 OpenClaw 改用 /fiat 建立新專案或新功能，在 Claude Code 才用 /tap 汲取對話](FIAT-fiat.md)
 4. [設定可用 ccrun 或 cdrun 叫起外部 AI harness 來寫程式](FIAT-ccrun-cdrun.md)
 5. [讓機器人在群聊裡可以發其它機器人不處理的訊息](FIAT-aside-for-bots.md)
+6. [/tap 汲取得到 OpenClaw 不在場時的對話，並從整體對話體會主述者要什麼](FIAT-tap-whole-room.md)

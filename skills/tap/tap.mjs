@@ -6,11 +6,15 @@
 //   node tap.mjs --channel telegram --target -1001234567890 --since 0
 //   node tap.mjs --format json
 //
-// 為什麼需要這支：openclaw CLI 沒有「讀取頻道歷史」的指令，而且被
-// chat-interceptor 攔掉的那些輸入**根本沒進 session**。但 gateway 早就把每一輪都
-// 寫在本機了，這支把兩類本機來源合併還原：
+// 為什麼需要這支：被 chat-interceptor 攔掉的那些輸入**根本沒進 session**，平台上也看不出
+// 它們的下場；而平台不一定讀得到歷史（Telegram 就不行）。這支把三類來源合併還原：
 //
-//   session 檔（AI 看到的）
+//   平台上的歷史（房間裡講過什麼，以它為準）
+//     6. 經由 gateway 的 /chat-interceptor/history（`openclaw message read`）
+//        → OpenClaw 不在場時講的也在：機器人被拉進討論串之前的、跟別的機器人談的。
+//          讀不到（平台不給、gateway 沒開）就只靠本機的紀錄
+//
+//   session 檔（AI 看到的，與 AI 的回應）
 //     1. <sessionId>.trajectory.jsonl 的 prompt
 //        → Conversation info(metadata，有 message_id 與發話者) + Conversation context
 //          (前幾則，格式 "#id  時間 GMT+8 名字: 內容")。context 裡連「AI 沒被叫醒
@@ -20,19 +24,20 @@
 //     3. agent/codex-home/sessions/**/rollout-*.jsonl
 //        → runtime 另一份副本，補 1 已被輪替掉的部分
 //     5. agent/openclaw-agent.sqlite（OpenClaw 2026.9 起）
-//        → session 全搬進這裡，上面 1、2 從此不再長大。使用者發言帶著 message id 與發話者
+//        → session 全搬進這裡，上面 1、2 從此不再長大。使用者發言帶著 message id 與發話者，也有 AI 的回應
 //
 //   offstage log（AI 沒看到的）
 //     4. chat-interceptor-offstage.log
 //        → script 接走的、script 出錯的、/aside（人打的，或其他機器人只給人看的訊息）。plugin 一直開著在記。
 //
 // session 來源都會有缺漏（session 輪替、context window 裁切），合併後才接近完整；
-// 輸出最後的「涵蓋範圍」會說還缺哪些 message id。
+// 輸出最後的「涵蓋範圍」會說還缺多少、看不看得出來。
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as zlib from "node:zlib";
+import { gatewayUrl } from "./gateway.mjs";
 
 // ---------------------------------------------------------------------------
 // 參數與 .tap
@@ -138,10 +143,13 @@ const byId = new Map(); // message id -> { id, ts, sender, text }
 const noId = []; // { ts, sender, text }：來自 transcript，沒有 message id
 const senderNames = new Map(); // sender id -> 顯示名稱，給 offstage 那些用
 
+/** Telegram 的 id 是小整數；Discord 的、按鍵的偽 id 超過 Number 的精度，留字串。 */
+const asId = (value) => (Number.isSafeInteger(Number(value)) ? Number(value) : String(value));
+
 function addById(id, ts, sender, text) {
   const key = String(id);
   const current = byId.get(key);
-  if (!current) byId.set(key, { id: Number(key), ts, sender, text });
+  if (!current) byId.set(key, { id: asId(key), ts, sender, text });
   // 同一則在不同來源被裁切的長度不同，留最長的那份
   else if (text && text.length > (current.text || "").length) current.text = text;
 }
@@ -301,7 +309,10 @@ stats.sqliteMessages = 0;
 
 const unzstd = (blob) => (zlib.zstdDecompressSync ? zlib.zstdDecompressSync(Buffer.from(blob)).toString("utf8") : null);
 
-/** transcript 的一個 event：只收使用者的發言。 */
+/** AI 選擇不回話時留下的字，房間裡看不到。 */
+const SILENT_RE = /^(?:NO_REPLY|HEARTBEAT_OK)$/;
+
+/** transcript 的一個 event：使用者的發言，與 AI 的回應。 */
 function harvestTranscriptEvent(json) {
   let parsed;
   try {
@@ -310,16 +321,20 @@ function harvestTranscriptEvent(json) {
     return;
   }
   const message = parsed?.type === "message" ? parsed.message : null;
-  if (!message || message.role !== "user") return;
+  if (!message || (message.role !== "user" && message.role !== "assistant")) return;
   const text =
     typeof message.content === "string"
       ? message.content
       : Array.isArray(message.content)
         ? message.content.filter((part) => part?.type === "text").map((part) => part.text).join("\n")
         : "";
+  const ts = localStamp(new Date(message.timestamp ?? parsed.timestamp));
+  if (message.role === "assistant") {
+    if (text.trim() && !SILENT_RE.test(text.trim())) noId.push({ ts, sender: "AI", text });
+    return;
+  }
   const meta = message.__openclaw ?? {};
   if (!text || (meta.transport?.channel && meta.transport.channel !== channel)) return;
-  const ts = localStamp(new Date(message.timestamp ?? parsed.timestamp));
   const sender = meta.senderName || "?";
   if (meta.senderId && meta.senderName) senderNames.set(String(meta.senderId), meta.senderName);
   stats.sqliteMessages++;
@@ -396,17 +411,62 @@ let offstageFound = false;
 }
 
 // ---------------------------------------------------------------------------
+// 6：平台上的歷史 —— 經由 gateway 的 `openclaw message read`
+// ---------------------------------------------------------------------------
+// 一頁要半分鐘，翻好幾頁就是好幾分鐘。`{ messages, complete }`，讀不到就是 `{ error }`。
+const platform = await readPlatform();
+
+async function readPlatform() {
+  let response;
+  try {
+    response = await fetch(gatewayUrl("/chat-interceptor/history"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ channel, target, since: sinceStamp ? stampMs(sinceStamp) : 0 }),
+    });
+  } catch (error) {
+    return { error: `cannot reach the OpenClaw gateway: ${error.cause?.message ?? error.message}` };
+  }
+  const answer = await response.json().catch(() => null);
+  if (!response.ok || !Array.isArray(answer?.messages)) return { error: answer?.error || `the gateway answered ${response.status}` };
+  return { messages: answer.messages.map(fromPlatform).filter(Boolean), complete: answer.complete === true, error: answer.error ?? null };
+}
+
+/** 平台原樣的訊息（Discord 的 message 物件）→ 逐字稿的一則。 */
+function fromPlatform(message) {
+  const at = Number(message?.timestampMs) || Date.parse(message?.timestamp ?? "");
+  if (message?.id == null || !at) return null;
+  const author = message.author ?? {};
+  const names = new Map((message.mentions ?? []).map((user) => [String(user.id), user.global_name || user.username]));
+  const text = [
+    String(message.content ?? "").replace(/<@!?(\d+)>/g, (all, id) => (names.get(id) ? `@${names.get(id)}` : all)),
+    ...(message.embeds ?? []).map((embed) => [embed?.title, embed?.description].filter(Boolean).join("\n")),
+    ...(message.attachments ?? []).map((file) => `[附件 ${file?.filename ?? file?.url ?? ""}]`),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  if (!text) return null;
+  const name = author.global_name || author.username || (author.id ? String(author.id) : "?");
+  if (author.id && !author.bot) senderNames.set(String(author.id), name);
+  return { id: asId(message.id), ts: localStamp(new Date(at)), sender: author.bot ? botLabel(name) : name, text, source: "platform" };
+}
+
+// ---------------------------------------------------------------------------
 // 合併成一條時間軸
 // ---------------------------------------------------------------------------
-// 同一則訊息可能同時出現在 session 檔與 offstage log（被攔下的那則，後來又在別一輪的
-// Conversation context 裡出現），合併時要認出它們是同一則，否則讀的人會以為講了兩次。
-// 認法：第一行的原文一樣，而且時間相差在 MATCH_WINDOW_MS 之內
-//（session 記的是 telegram 收訊時間，offstage 記的是 hook 跑起來的時間，差幾秒是正常的）。
+// 同一則訊息可能同時出現在好幾個來源（平台、session、offstage log——被攔下的那則，後來又在
+// 別一輪的 Conversation context 裡出現），合併時要認出它們是同一則，否則讀的人會以為講了兩次。
+// 認法：message id 一樣；沒有 id 的，第一行的原文一樣，而且時間相差在 MATCH_WINDOW_MS 之內
+//（各來源記的時間不一樣：平台的送出時間、session 的收訊時間、offstage 的 hook 跑起來的時間）。
 const MATCH_WINDOW_MS = 5 * 60 * 1000;
 const firstLine = (text) => String(text ?? "").split("\n")[0].trim();
 // 機器人的 /aside 開頭是一個看不見的記號（U+E0021），session 裡看到的那一則會帶著它。
-const stripAside = (text) => String(text ?? "").replace(/^(?:\u{E0021}|\/aside(?:@\S+)?(?![\w-]))/iu, "").trim();
-const botLabel = (name) => `${name ?? "?"}（機器人）`;
+const ASIDE_RE = /^(?:\u{E0021}|\/aside(?:@\S+)?(?![\w-]))/iu;
+const stripAside = (text) => String(text ?? "").replace(ASIDE_RE, "").trim();
+function botLabel(name) {
+  const label = String(name ?? "?");
+  return label.endsWith("（機器人）") ? label : `${label}（機器人）`;
+}
 
 const messages = [
   ...[...byId.values()].map((m) => ({ ...m, source: "session" })),
@@ -424,14 +484,14 @@ const merged = messages.filter((m) => {
   return true;
 });
 
-/** 在 candidates 裡找出與 (ts, text) 是同一則、而且還沒被認領的那一筆。 */
-function findSame(candidates, ts, text, pick) {
+/** 在 candidates 裡找出與 (ts, text) 是同一則、而且還沒被認領（free）的那一筆。 */
+function findSame(candidates, ts, text, pick, free = (candidate) => !candidate.kind) {
   const wanted = firstLine(text);
   const at = stampMs(ts);
   let best = null;
   let bestGap = Infinity;
   for (const candidate of candidates) {
-    if (candidate.kind || firstLine(pick(candidate.text)) !== wanted) continue;
+    if (!free(candidate) || firstLine(pick(candidate.text)) !== wanted) continue;
     const gap = Math.abs(stampMs(candidate.ts) - at);
     if (gap > MATCH_WINDOW_MS || gap >= bestGap) continue;
     best = candidate;
@@ -440,25 +500,55 @@ function findSame(candidates, ts, text, pick) {
   return best;
 }
 
-// offstage 的每一筆：對得上 session 那則就把下場貼上去，對不上就自成一筆
+// 讀得到平台，就以平台為主幹：本機的每一則對得上平台那一則就算同一則。平台翻到了的那段時間裡，
+// 本機有、平台沒有的，是沒送出去的（AI 不回話、中途的旁白）或寫法不一樣的同一則，不收。
+let base = merged;
+let platformFrom = null; // 平台翻到的最舊那一則；翻完整了就是 null
+if (platform.messages) {
+  const theirs = platform.messages;
+  const theirIds = new Map(theirs.map((m) => [String(m.id), m]));
+  if (!platform.complete && theirs.length) platformFrom = theirs.reduce((a, b) => (b.ts < a.ts ? b : a)).ts;
+  const covered = (ts) => platform.complete || (platformFrom !== null && ts >= platformFrom);
+  const kept = [];
+  for (const m of merged) {
+    const same = (m.id != null && theirIds.get(String(m.id))) || findSame(theirs, m.ts, m.text, (text) => text, (c) => !c.local);
+    if (same) same.local = true;
+    else if (!covered(m.ts)) kept.push(m);
+  }
+  base = [...theirs, ...kept];
+}
+
+// offstage 的每一筆：對得上那一則就把下場貼上去，對不上就自成一筆
 //（那正是「被攔截、從來沒進過 session」的訊息——這支工具存在的理由）。
-const timeline = [...merged];
+const timeline = [...base];
 for (const entry of offstage) {
   const pick = entry.kind === "aside" ? stripAside : (text) => text;
   const name = entry.senderId ? (senderNames.get(entry.senderId) ?? entry.senderId) : null;
   const sender = entry.bot ? botLabel(name) : name;
-  const message = findSame(merged, entry.ts, entry.text, pick);
+  const message = findSame(base, entry.ts, entry.text, pick);
   if (message) {
-    Object.assign(message, { kind: entry.kind, reply: entry.reply, text: entry.kind === "aside" ? entry.text : message.text });
+    Object.assign(message, { kind: entry.kind, reply: entry.reply, local: true, text: entry.kind === "aside" ? entry.text : message.text });
     if (entry.bot) message.sender = botLabel(message.sender);
   } else {
     timeline.push({ ts: entry.ts, id: null, sender, text: entry.text, kind: entry.kind, reply: entry.reply, source: "offstage" });
   }
 }
+// offstage log 沒記到的 /aside（例如這一台自己送出去的，hook 看不到）：從原文認。
+for (const message of timeline) {
+  if (message.kind || !ASIDE_RE.test(message.text)) continue;
+  if (message.text.startsWith("\u{E0021}")) message.sender = botLabel(message.sender);
+  Object.assign(message, { kind: "aside", text: stripAside(message.text) });
+}
 
-const shown = timeline
-  .filter((entry) => !sinceStamp || pad(entry.ts) >= sinceStamp)
-  .sort((a, b) => (a.ts === b.ts ? (a.id ?? 0) - (b.id ?? 0) : a.ts < b.ts ? -1 : 1))
+/** id 的先後：位數多的大，同位數照字串比——Discord 的 id 超過 Number 的精度。 */
+const idOrder = (a, b) => {
+  const x = String(a ?? "");
+  const y = String(b ?? "");
+  return x.length - y.length || (x < y ? -1 : x > y ? 1 : 0);
+};
+const inWindow = timeline.filter((entry) => !sinceStamp || pad(entry.ts) >= sinceStamp);
+const shown = inWindow
+  .sort((a, b) => (a.ts === b.ts ? idOrder(a.id, b.id) : a.ts < b.ts ? -1 : 1))
   .map(({ ts, id, sender, text, kind, reply, source }) => ({
     ts,
     id: id ?? null,
@@ -479,56 +569,74 @@ const summary = {
   aside: count("aside"),
 };
 
-// 缺哪些 message id：這段範圍內從最小掃到最大，沒收錄到的就是漏的，收成一段一段的。
+// 缺了多少。讀得到平台就照平台：翻完整了就沒缺，沒翻完整就說翻到哪裡。
+// 讀不到平台，只能從本機收到的 message id 看：Telegram 的 id 在一個房間裡是連號的，
+// 這段範圍內從最小掃到最大，沒收錄到的就是漏的，收成一段一段的。看不出來就是 null（不知道），不是 0。
 //
-// **但這個範圍不一定是真的 message id 範圍。** 按鍵（callback）在 transcript 裡帶的是
-// 1e18 等級的偽 id；只要頻道裡有人按過鍵盤，這個迴圈就會想從四位數一路數到那個
-// 天文數字。所以掃描範圍設上限：超過就放棄缺漏偵測（在涵蓋範圍裡誠實說明）。
-// 汲取對話是主要目的，缺漏清單只是附帶資訊，不該讓附帶資訊弄死主要目的。
+// 按鍵（callback）的偽 id 是 1e18 等級、Discord 的 id 也不連號，asId 都留成字串，不掃。
+// 範圍還是太大就放棄：汲取對話是主要目的，缺漏清單只是附帶資訊，不該讓附帶資訊弄死主要目的。
 const MAX_GAP_SCAN = 100_000;
-const withId = [...byId.values()].sort((a, b) => a.id - b.id);
-const inRange = withId.filter((m) => !sinceStamp || pad(m.ts) >= sinceStamp);
-const missingIds = [];
-let missingCount = 0;
-let gapScanned = true;
-if (inRange.length) {
+const withId = [...byId.values()].sort((a, b) => idOrder(a.id, b.id));
+const inRange = withId.filter((m) => typeof m.id === "number" && (!sinceStamp || pad(m.ts) >= sinceStamp));
+let missingCount = null;
+let missingIds = null;
+if (platform.messages) {
+  if (platform.complete && !platform.error) [missingCount, missingIds] = [0, []];
+} else if (inRange.length && inRange[inRange.length - 1].id - inRange[0].id <= MAX_GAP_SCAN) {
+  [missingCount, missingIds] = [0, []];
   const lo = inRange[0].id;
   const hi = inRange[inRange.length - 1].id;
-  if (hi - lo > MAX_GAP_SCAN) gapScanned = false;
-  else {
-    let start = null;
-    for (let i = lo; i <= hi + 1; i++) {
-      const missing = i <= hi && !byId.has(String(i));
-      if (missing) {
-        missingCount += 1;
-        start ??= i;
-      } else if (start !== null) {
-        missingIds.push(start === i - 1 ? String(start) : `${start}-${i - 1}`);
-        start = null;
-      }
+  let start = null;
+  for (let i = lo; i <= hi + 1; i++) {
+    const missing = i <= hi && !byId.has(String(i));
+    if (missing) {
+      missingCount += 1;
+      start ??= i;
+    } else if (start !== null) {
+      missingIds.push(start === i - 1 ? String(start) : `${start}-${i - 1}`);
+      start = null;
     }
   }
 }
 
+// 本機一筆這個房間的紀錄都沒有：OpenClaw 從來沒在這裡收過話。平台也讀不到的話，這份汲取什麼都不代表。
+const localRecords =
+  stats.trajectoryFiles + stats.transcriptFiles + stats.rolloutFiles + (stats.sqliteSessions ?? 0) > 0 || offstage.length > 0;
+const blind = !localRecords && !platform.messages;
+const warning = blind
+  ? `OpenClaw 本機沒有這個房間的任何紀錄，平台的歷史也讀不到（${platform.error}）：這份汲取看不到這個房間的對話，不代表房間是空的。`
+  : null;
+
+const onPlatform = inWindow.filter((entry) => entry.source === "platform");
 const coverage = {
   channel,
   target: bareTarget,
   agents: agentIds,
   since: sinceStamp,
+  platform: platform.messages
+    ? {
+        messages: onPlatform.length,
+        onlyOnPlatform: onPlatform.filter((entry) => !entry.local).length,
+        complete: platform.complete,
+        ...(platformFrom ? { from: platformFrom } : {}),
+        ...(platform.error ? { error: platform.error } : {}),
+      }
+    : { error: platform.error },
+  localRecords,
   files: stats,
   offstageLog: offstageFound ? offstagePath : null,
-  recovered: { withId: withId.length, transcriptOnly: merged.length - withId.length, offstageOnly: timeline.length - merged.length },
+  recovered: { withId: withId.length, transcriptOnly: merged.length - withId.length, offstageOnly: timeline.length - base.length },
   idRange: inRange.length ? [inRange[0].id, inRange[inRange.length - 1].id] : null,
-  missing: gapScanned ? missingCount : null,
-  missingIds: gapScanned ? missingIds : null,
+  missing: missingCount,
+  missingIds,
 };
 
 // ---------------------------------------------------------------------------
 // 輸出
 // ---------------------------------------------------------------------------
 if (format === "json") {
-  console.log(JSON.stringify({ tap: tapPath ?? null, coverage, summary, timeline: shown }, null, 1));
-  process.exit(0);
+  console.log(JSON.stringify({ tap: tapPath ?? null, ...(warning ? { warning } : {}), coverage, summary, timeline: shown }, null, 1));
+  process.exit(blind ? 3 : 0);
 }
 
 const indent = (text, prefix) =>
@@ -544,6 +652,10 @@ console.log(
   `逐字稿 ${summary.messages} 則，其中 AI 沒看到的 ${summary.offstage} 則` +
     `（script 接走 ${summary.script}、script 出錯 ${summary.error}、/aside ${summary.aside}）`,
 );
+if (warning) {
+  console.log("");
+  console.log(`**${warning}**`);
+}
 
 // ---- /aside：房間裡特地留下、誰都不處理的話 ----
 if (asides.length) {
@@ -567,7 +679,7 @@ const MARKS = {
 console.log("");
 console.log("## 逐字稿");
 console.log("");
-console.log("`時間　#message id 發話者：內容`。底下沒有 ↳ 的，都是 AI 看到的。");
+console.log("`時間　#message id 發話者：內容`。被 script 接走、script 出錯、/aside 的，底下有一行 ↳。");
 console.log("");
 for (const entry of shown) {
   const id = entry.id ? `#${entry.id} ` : "";
@@ -591,7 +703,14 @@ console.log("");
 console.log("```json");
 console.log(JSON.stringify(coverage, null, 1));
 console.log("```");
-if (!gapScanned) {
-  console.log("");
-  console.log("（`missingIds: null` ＝ 這個頻道有人按過鍵盤，id 範圍被偽 id 撐爆，放棄缺漏偵測。其餘照常。）");
-}
+console.log("");
+const notes = [
+  platform.messages
+    ? platform.complete
+      ? "逐字稿以平台的歷史為準。"
+      : `平台只翻到 ${platformFrom ?? "?"}，更早的只有本機的紀錄。`
+    : "平台的歷史讀不到，逐字稿只有本機的紀錄。",
+  missingCount === null ? "`missing: null` ＝ 看不出缺了哪些。" : null,
+];
+console.log(`（${notes.filter(Boolean).join("")}）`);
+process.exitCode = blind ? 3 : 0;

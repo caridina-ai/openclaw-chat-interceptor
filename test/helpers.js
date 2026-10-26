@@ -162,8 +162,10 @@ export function fakeRunner(dir, name) {
 }
 
 /**
- * 假的 `openclaw` CLI，只會兩件事：
+ * 假的 `openclaw` CLI，只會三件事：
  *   message send …                         把 send 之後的參數記進 NOTIFY_LOG，一行一次
+ *   message read … --limit N [--before id] 從 FAKE_HISTORY（JSON 陣列，新的在前）翻一頁，印出跟真的一樣的外殼；
+ *                                          參數記進 HISTORY_LOG。FAKE_HISTORY_ERROR 有設：照真的那樣失敗
  *   skills install <dir> --force --agent X  複製進 FAKE_WORKSPACE/<agent>/skills/<slug>，
  *                                          記進 INSTALL_LOG，印出跟真的一樣的那一行
  *                                          FAKE_INSTALL_EPERM 有設：學 Windows 上真的發生過的那樣，
@@ -179,6 +181,19 @@ export function fakeOpenclaw(dir) {
     const args = process.argv.slice(2);
     if (args[0] === "message" && args[1] === "send") {
       fs.appendFileSync(process.env.NOTIFY_LOG, JSON.stringify(args.slice(2)) + "\\n", "utf8");
+      process.exit(0);
+    }
+    if (args[0] === "message" && args[1] === "read") {
+      const opt = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+      if (process.env.HISTORY_LOG) fs.appendFileSync(process.env.HISTORY_LOG, JSON.stringify(args.slice(2)) + "\\n", "utf8");
+      if (process.env.FAKE_HISTORY_ERROR) {
+        process.stderr.write("[openclaw] The CLI command failed.\\n[openclaw] Reason: Error: " + process.env.FAKE_HISTORY_ERROR + "\\n[openclaw] Try: openclaw doctor\\n");
+        process.exit(1);
+      }
+      const all = JSON.parse(fs.readFileSync(process.env.FAKE_HISTORY, "utf8"));
+      const from = opt("--before") ? all.findIndex((m) => m.id === opt("--before")) + 1 : 0;
+      const messages = all.slice(from, from + Number(opt("--limit") || 50));
+      process.stdout.write(JSON.stringify({ action: "read", channel: opt("--channel"), handledBy: "plugin", payload: { ok: true, messages } }, null, 2));
       process.exit(0);
     }
     if (args[0] === "skills" && args[1] === "install") {

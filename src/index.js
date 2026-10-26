@@ -46,6 +46,7 @@ import {
   readTap,
   removeInstalledSkill,
   roomKey,
+  run,
   sessionAlive,
   skillDirOf,
   tapFileOf,
@@ -58,6 +59,8 @@ const DEFAULT_OFFSTAGE_LOG_FILE = join(homedir(), ".openclaw", "logs", "chat-int
 const DEFAULT_TIMEOUT_MS = 60_000;
 /** /tap 的回報程式（skills/tap/report.mjs）把每一段交回 gateway 的路由。 */
 const REPORT_ROUTE = "/chat-interceptor/report";
+/** /tap 的汲取程式（skills/tap/tap.mjs）向平台讀房間歷史的路由。 */
+const HISTORY_ROUTE = "/chat-interceptor/history";
 
 /** script 用這個 exit code 說「這句我不會，請交給 AI」。 */
 const EXIT_PASS = 20;
@@ -854,6 +857,7 @@ async function uninstall(config, settings, room, key, entry) {
 // 所以回報程式只把「哪一輪、哪一段、一段話」POST 到這裡，該做的事全在 gateway 做：
 //
 //   fiat   回報；這一輪是連續版（`go` 記著）的話，替它注入 `go`
+//   empty  沒寫成 FIAT 文件：回報，並排好關掉 session（timestamp 不動，下一輪還從同一個地方汲取）
 //   built  把專案的 skill 裝進 OpenClaw、在房間上線（等同 /fiat -install），再回報
 //   done   更新 .tap 的 timestamp、回報，並排好關掉 session
 //
@@ -864,20 +868,23 @@ async function uninstall(config, settings, room, key, entry) {
 // 從手機接手之後，是在 Codex app 裡接著跑的，那裡沒有 /fiat 叫起時的環境變數。
 // 房間被 -uninstall、專案換了、session 已經關了，就什麼都不做，只告訴它。
 
-const REPORT_STAGES = new Set(["fiat", "built", "done"]);
+const REPORT_STAGES = new Set(["fiat", "empty", "built", "done"]);
+
+/** 回一個 JSON。 */
+function answerJson(res, status, body) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body));
+  return true;
+}
+
+/** 瀏覽器跨站送來的一定帶 Origin，而 JSON 的 POST 會先被 preflight 擋下。 */
+const fromLocalProgram = (req) => !req.headers.origin && /^application\/json\b/i.test(String(req.headers["content-type"] ?? ""));
 
 async function receiveReport(api, req, res) {
-  const answer = (status, body) => {
-    res.statusCode = status;
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(JSON.stringify(body));
-    return true;
-  };
+  const answer = (status, body) => answerJson(res, status, body);
   if (req.method !== "POST") return answer(405, { error: "POST a report here." });
-  // 只收本機程式送的：瀏覽器跨站送來的一定帶 Origin，而 JSON 的 POST 會先被 preflight 擋下。
-  if (req.headers.origin || !/^application\/json\b/i.test(String(req.headers["content-type"] ?? ""))) {
-    return answer(403, { error: "Reports come from the /tap report program only." });
-  }
+  if (!fromLocalProgram(req)) return answer(403, { error: "Reports come from the /tap report program only." });
   let request;
   try {
     request = JSON.parse(await readBody(req, 256 * 1024));
@@ -921,6 +928,83 @@ function readBody(req, limit) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 房間的歷史：tap.mjs 向平台讀
+// ---------------------------------------------------------------------------
+// 本機的紀錄只有 OpenClaw 在場時收到的那些：機器人被拉進討論串之前、房間裡跟別的機器人談的，
+// 本機一則都沒有。平台讀得到（例如 Discord）就以平台為準。讀法是 `openclaw message read`，
+// 跟送訊息同一條路；放在 gateway 做，是因為 Codex 的 sandbox 裡 node 開不了子行程。
+// 從新往舊一頁一頁翻，翻過 `since` 或翻到底就停。CLI 每叫一次要半分鐘，所以頁數有上限。
+
+const HISTORY_PAGE = 100;
+const HISTORY_PAGES = 10;
+
+async function receiveHistory(api, req, res) {
+  const answer = (status, body) => answerJson(res, status, body);
+  if (req.method !== "POST") return answer(405, { error: "POST a history read here." });
+  // 整個房間的歷史：只給這台機器上的程式。
+  if (!/^(?:127\.|::1$|::ffff:127\.)/.test(String(req.socket?.remoteAddress ?? "")) || !fromLocalProgram(req)) {
+    return answer(403, { error: "History is for the /tap program on this machine only." });
+  }
+  let request;
+  try {
+    request = JSON.parse(await readBody(req, 16 * 1024));
+  } catch (error) {
+    return answer(400, { error: `not a history read: ${String(error?.message || error)}` });
+  }
+  const { channel, target } = request ?? {};
+  if (!channel || !target) return answer(400, { error: "a history read needs the channel and the target." });
+
+  // 翻好幾頁要好幾分鐘：header 先送，每翻完一頁送一個空白，對方才不會以為斷線（JSON 前面的空白不影響解析）。
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.flushHeaders?.();
+  const openclaw = openclawOf(fiatConfigOf(liveConfig(api))?.openclaw);
+  const result = await readHistory(openclaw, { channel: String(channel), target: String(target) }, Number(request.since) || 0, () =>
+    res.write(" "),
+  );
+  res.end(JSON.stringify(result));
+  return true;
+}
+
+/**
+ * `{ messages, complete }`：messages 是平台原樣的訊息物件，新的在前；complete 是翻過了 since 或翻到底。
+ * 第一頁就讀不到（平台不給讀，例如 Telegram）是 `{ error }`；翻到一半出事，已經讀到的照給，加上 error。
+ */
+async function readHistory(openclaw, room, since, onPage) {
+  const messages = [];
+  let before = null;
+  for (let page = 0; page < HISTORY_PAGES; page += 1) {
+    const read = await run(
+      [...openclaw, "message", "read"],
+      ["--channel", room.channel, "--target", room.target, "--limit", String(HISTORY_PAGE), "--json", ...(before ? ["--before", before] : [])],
+      { timeout: 120_000 },
+    );
+    onPage();
+    let batch = null;
+    let error = read.ok ? null : cliReason(read.failure);
+    if (!error) {
+      try {
+        batch = JSON.parse(read.stdout.slice(Math.max(0, read.stdout.search(/^\{/m)))).payload?.messages;
+      } catch {
+        // 下面一起說
+      }
+      if (!Array.isArray(batch)) error = "openclaw message read did not return a list of messages";
+    }
+    if (error) return page ? { messages, complete: false, error } : { error };
+    messages.push(...batch);
+    const oldest = batch.reduce((a, b) => (messageTime(b) < messageTime(a) ? b : a), batch[0]);
+    if (batch.length < HISTORY_PAGE || !oldest?.id || messageTime(oldest) < since) return { messages, complete: true };
+    before = String(oldest.id);
+  }
+  return { messages, complete: false };
+}
+
+const messageTime = (message) => Number(message?.timestampMs) || Date.parse(message?.timestamp ?? "") || 0;
+
+/** CLI 失敗時印一大段，原因在 `Reason:` 那一行。 */
+const cliReason = (failure) => /Reason:\s*(.+)/.exec(failure)?.[1].trim() || String(failure).trim().split("\n").at(-1) || "openclaw message read failed";
+
 /** 路由拿不到指令的 ctx：設定從 gateway 當下那一份取，取不到才用載入時的。 */
 const liveConfig = (api) => api.runtime?.config?.current?.()?.plugins?.entries?.[PLUGIN_ID]?.config ?? api.pluginConfig ?? {};
 
@@ -933,6 +1017,8 @@ async function report(settings, key, entry, room, stage, message) {
   const lines = [];
   if (stage === "fiat") {
     lines.push(`${name}: FIAT ready`, message, entry.go ? "Implementing it now (-go)." : "Read it, then /fiat -go to implement.");
+  } else if (stage === "empty") {
+    lines.push(`${name}: no FIAT`, message, `Closing ${sessionLabel(settings, entry)}.`);
   } else if (stage === "built") {
     lines.push(`${name}: built`, message);
     const installed = await installSkill({ ...settings, name, dir: entry.dir, agent: entry.agent, installedDir: entry.installedDir });
@@ -964,7 +1050,7 @@ async function report(settings, key, entry, room, stage, message) {
     const queued = await inject(sessionRunner(settings, entry), entry.pid, "go");
     if (!queued.ok) done.push(`could not send go: ${queued.failure}`);
   }
-  if (entry.pid && stage === "done") {
+  if (entry.pid && (stage === "done" || stage === "empty")) {
     // pid 留著：那是關它的把手。
     patchRoom(settings.projectsFile, key, { closing: true, go: undefined });
     closeSoon(settings, key, entry, room);
@@ -1007,6 +1093,13 @@ export default definePluginEntry({
       auth: "plugin",
       match: "exact",
       handler: (req, res) => receiveReport(api, req, res),
+    });
+    // 只收本機來的，見 receiveHistory。
+    api.registerHttpRoute({
+      path: HISTORY_ROUTE,
+      auth: "plugin",
+      match: "exact",
+      handler: (req, res) => receiveHistory(api, req, res),
     });
   },
 });

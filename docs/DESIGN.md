@@ -144,7 +144,8 @@ openclaw-chat-interceptor/
 ├── skills/tap/                 # /tap：給 Claude Code 或 Codex 裝的技能（見 2.8）
 │   ├── SKILL.md
 │   ├── tap.mjs                 # 汲取對話
-│   └── report.mjs              # 回報程式：每一段結束時呼叫（見 2.9）
+│   ├── report.mjs              # 回報程式：每一段結束時呼叫（見 2.9）
+│   └── gateway.mjs             # 上面兩支找本機 gateway 的路由
 ├── skills/group-aside/         # OpenClaw 技能，隨 plugin 載入：群聊裡怎麼說只給人看的話（見 2.7）
 ├── genesis/                    # 本專案的委託書：FIATLUX.md 與後續的 FIAT-*.md
 └── docs/
@@ -373,7 +374,7 @@ append 一行 `<當地時間> {"kind":"aside", …}`。兩個入口：
 正好是看不到的那些。**
 
 `skills/tap/` 是一個 [Agent Skill](https://github.com/vercel-labs/skills)
-（`npx skills add`，裝進 Claude Code 或 Codex），`tap.mjs` 把五個本機來源合併還原：
+（`npx skills add`，裝進 Claude Code 或 Codex），`tap.mjs` 把平台的歷史與五個本機來源合併還原：
 
 | # | 來源 | 給得出什麼 |
 |---|---|---|
@@ -381,17 +382,33 @@ append 一行 `<當地時間> {"kind":"aside", …}`。兩個入口：
 | 2 | `<sessionId>.jsonl`（含 `.reset.`／`.deleted.`） | 乾淨的 `role:user` 原文，但沒有 message id |
 | 3 | `agent/codex-home/sessions/**/rollout-*.jsonl` | runtime 的另一份副本，補 1 已被輪替掉的部分 |
 | 4 | offstage log | AI 沒看到的那些：script 接走、script 出錯、`/aside`（帶記號的，發話者標著「機器人」） |
-| 5 | `agent/openclaw-agent.sqlite`（OpenClaw 2026.9 起） | session 全搬進這裡，1、2 從此不再長大。`transcript_events` 的使用者發言直接帶 message id 與發話者；一部分 event 是 zstd 壓縮存的；被換掉的 session 封存在 `session_transcript_archives`。唯讀開啟，gateway 正開著它 |
+| 5 | `agent/openclaw-agent.sqlite`（OpenClaw 2026.9 起） | session 全搬進這裡，1、2 從此不再長大。`transcript_events` 的使用者發言直接帶 message id 與發話者，AI 的回應也在；一部分 event 是 zstd 壓縮存的；被換掉的 session 封存在 `session_transcript_archives`。唯讀開啟，gateway 正開著它 |
+| 6 | 平台上的歷史（gateway 的 `/chat-interceptor/history`） | 房間裡講過的每一則，包括 OpenClaw 不在場時講的。Discord 讀得到；Telegram 不給讀 |
 
 1～3 都會有缺漏（session 輪替、context window 裁切），合併後才接近完整。
-同一則訊息可能同時出現在 session 與 offstage log（被攔下的那則，後來又出現在別一輪的
-context 裡），工具用「第一行原文相同且時間相差 5 分鐘內」收斂成同一則，
+同一則訊息可能同時出現在好幾個來源（被攔下的那則，後來又出現在別一輪的 context 裡），
+工具用「message id 相同，或第一行原文相同且時間相差 5 分鐘內」收斂成同一則，
 否則讀的人會以為使用者把同一件事講了兩次。
 
-一個實務上會炸掉的細節：按鍵（callback）在 transcript 裡帶的是 1e18 等級的**偽
-message id**，不是 telegram 的 id。缺漏偵測若照著 id 範圍從頭數到尾，會直接
-`RangeError` 而整支工具掛掉——所以掃描範圍設了上限，超過就放棄缺漏偵測並誠實說明。
+**本機的紀錄只有 OpenClaw 在場時收到的那些。** 機器人被拉進 Discord 討論串之前的對話、房間裡跟別的
+機器人談的，本機一則都沒有——而 `/fiat` 的用法本來就是「先聊，聊完再叫」，聊的時候 OpenClaw 在不在場，
+主述者不會注意到。所以平台讀得到歷史時，**以平台為主幹**：本機那幾個來源只補上平台看不到的那一層
+（offstage 的 ↳ 下場）；平台翻到的那段時間裡，本機有、平台對不上的（沒送出去的旁白、寫法不同的同一則）不收。
+
+- 讀法是 `openclaw message read`，從新往舊一頁 100 則，翻過起點或翻到底就停。它在 **gateway 裡**跑：
+  Codex 的 sandbox 開不了子行程（同 2.9 的回報程式）。CLI 每叫一次要半分鐘，所以最多翻 10 頁，沒翻完整就照實說翻到哪裡；
+  翻的時候 header 先送、每頁送一個空白，汲取那一端才不會以為斷線。
+- 這條路由讀得到整個房間的歷史，所以只收本機來的連線（另外跟回報一樣，只收 JSON、不帶 `Origin`）。
+- 平台給的是原樣的訊息物件：機器人發的標「機器人」，開頭帶記號的是 plugin 送的（2.7），當成機器人的 `/aside`。
+
+**缺漏要分得出「沒缺」和「不知道」。** 讀得到平台，翻完整就是沒缺。讀不到平台，只能從本機收到的
+message id 看：Telegram 的 id 在一個房間裡連號，範圍內沒收錄到的就是漏的。Discord 的 id 不連號，
+按鍵（callback）在 transcript 裡帶的又是 1e18 等級的**偽 message id**——這兩種都超過 Number 的精度，
+留成字串、不掃（照著 id 範圍從頭數到尾，會直接 `RangeError` 而整支工具掛掉）。看不出來就是 `null`，不是 0。
 **汲取對話是主要目的，缺漏清單只是附帶資訊，不該讓附帶資訊弄死主要目的。**
+
+本機一筆這個房間的紀錄都沒有、平台也讀不到時，汲取結果什麼都不代表：輸出開頭印警告、以 3 結束。
+寫程式的 AI 這時不寫 FIAT 文件，用 `empty` 回報（2.9）。
 
 房間位置寫在各專案自己的 `genesis/.tap`（`channel` / `target` / `timestamp` 三個欄位，
 不進版控）。`timestamp` 是上一輪結束的時間，汲取從那裡開始。
@@ -448,6 +465,7 @@ plugin 註冊的 HTTP 路由 `/chat-interceptor/report`，其餘的事都在 gat
 | 階段 | gateway 做的事 |
 |---|---|
 | `fiat` | 回報；`go` 記著的話，往 session 打 `go`，並把 `go` 消掉 |
+| `empty` | 汲取之後沒寫成 FIAT 文件：回報，消掉 `go`，標 `closing` 關掉 session。`timestamp` 不動 |
 | `built` | 把 skill 裝進 OpenClaw、在房間上線（等同 `/fiat -install`），再回報 |
 | `done` | 更新 `.tap` 的 `timestamp`、回報，標 `closing`，等 session 把這一輪講完再從外面關掉 |
 

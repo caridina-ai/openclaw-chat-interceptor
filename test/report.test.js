@@ -110,7 +110,7 @@ it("does nothing outside a /fiat project", async () => {
 it("refuses an unknown stage", async () => {
   const result = await report(["finished", "hello"]);
   assert.equal(result.code, 2);
-  assert.match(result.stderr, /usage: node report\.mjs <fiat\|built\|done>/);
+  assert.match(result.stderr, /usage: node report\.mjs <fiat\|empty\|built\|done>/);
 });
 
 it("posts into the room the project's .tap names", async () => {
@@ -186,6 +186,22 @@ describe("fiat", () => {
     setEntry({ harness: "codex", go: true });
     await report(["fiat", "FIAT-x.md"]);
     assert.deepEqual(calls("inject"), [{ runner: "cdrun", mode: "inject", pid: 4242, text: "go" }]);
+  });
+});
+
+// 汲取之後沒寫成 FIAT 文件：只把話轉給房間。連續版也不注入 go，timestamp 不動，這一輪就結束。
+describe("empty", () => {
+  it("says so, keeps the timestamp, and closes the session", async () => {
+    setEntry({ go: true });
+    const tap = readFileSync(join(project, "genesis", ".tap"), "utf8");
+    const result = await report(["empty", "房間裡沒有講到要做什麼"]);
+    assert.deepEqual(messages(), ["ledger: no FIAT\n房間裡沒有講到要做什麼\nClosing Claude Code."]);
+    assert.equal(readFileSync(join(project, "genesis", ".tap"), "utf8"), tap);
+    assert.deepEqual(calls("inject"), []);
+    assert.match(result.stdout, /this session will be closed shortly\.$/);
+    await waitFor(() => calls("quit").length, "the session to be closed");
+    await waitFor(() => entry().pid === undefined, "the session to be forgotten");
+    assert.equal(entry().go, undefined);
   });
 });
 
