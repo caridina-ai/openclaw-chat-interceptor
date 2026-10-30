@@ -251,7 +251,7 @@ describe("done", () => {
     await waitFor(() => calls("quit").length, "the session to be closed");
     assert.deepEqual(calls("quit"), [{ runner: "ccrun", mode: "quit", pid: 4242 }]);
     await waitFor(() => entry().pid === undefined, "the session to be forgotten");
-    assert.deepEqual(entry(), { name: "ledger", dir: project, installed: true });
+    assert.deepEqual(entry(), { name: "ledger", dir: project, installed: true, harness: "claude" });
   });
 
   it("closes a Codex session with cdrun", async () => {

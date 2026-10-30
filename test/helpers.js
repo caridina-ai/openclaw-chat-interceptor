@@ -137,6 +137,8 @@ export const samePath = (a, b) => realpathSync(a).toLowerCase() === realpathSync
  *   -d <dir> <prompt>   印出 pid（RUNNER_PID，預設 4242）；RUNNER_FAIL 有值就失敗
  *   -p <pid> -s         pid 列在 RUNNER_ALIVE 裡才成功
  *   -p <pid> <text>     同上，成功時記下打了什麼
+ *   -p <pid> -q         同上，記下來；RUNNER_QUIT_FAIL 有值就失敗
+ *   -m <from> <to>      記下來；跟真的一樣，目錄要先搬好（to 在、from 不在）。RUNNER_MOVE_FAIL 是自己的名字就失敗
  */
 export function fakeRunner(dir, name) {
   return fixture(
@@ -146,6 +148,12 @@ export function fakeRunner(dir, name) {
     const fs = await import("node:fs");
     const args = process.argv.slice(2);
     const log = (entry) => fs.appendFileSync(process.env.RUNNER_LOG, JSON.stringify({ runner: "${name}", ...entry }) + "\\n", "utf8");
+    if (args[0] === "-m") {
+      log({ mode: "move", from: args[1], to: args[2] });
+      if (!fs.existsSync(args[2]) || fs.existsSync(args[1])) { process.stderr.write("${name}: move the directory first"); process.exit(1); }
+      if (process.env.RUNNER_MOVE_FAIL === "${name}") { process.stderr.write("${name}: cannot move\\nusage: ${name} …"); process.exit(1); }
+      process.exit(0);
+    }
     if (args[0] === "-d") {
       await new Promise((r) => setTimeout(r, Number(process.env.RUNNER_DELAY || 0)));
       log({ mode: "launch", dir: args[1], prompt: args[2], report: process.env.FIAT_REPORT, context: process.env.FIAT_CONTEXT });
@@ -155,8 +163,10 @@ export function fakeRunner(dir, name) {
     }
     const alive = String(process.env.RUNNER_ALIVE || "").split(",").includes(args[1]);
     if (!alive) { process.stderr.write("pid " + args[1] + " is not a session of mine"); process.exit(1); }
-    if (args[2] === "-q") log({ mode: "quit", pid: Number(args[1]) });
-    else if (args[2] !== "-s") log({ mode: "inject", pid: Number(args[1]), text: args[2] });
+    if (args[2] === "-q") {
+      log({ mode: "quit", pid: Number(args[1]) });
+      if (process.env.RUNNER_QUIT_FAIL) { process.stderr.write(process.env.RUNNER_QUIT_FAIL); process.exit(1); }
+    } else if (args[2] !== "-s") log({ mode: "inject", pid: Number(args[1]), text: args[2] });
     process.exit(0);`,
   );
 }

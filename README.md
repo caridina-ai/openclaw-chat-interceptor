@@ -38,6 +38,7 @@ npx skills add caridina-ai/openclaw-chat-interceptor --skill tap -a codex -g
 ```
 
 第一行是叫起它的程式，第二行是它要用的 `/tap` 技能。
+裝著的程式太舊、不認得 `-m` 的話，`/fiat -rename` 會被拒（什麼都不會改），重跑一次第一行就好。
 
 兩個都照你自己的設定跑（模型、權限），`/fiat` 不另外指定。Codex 要一路做完不停下來問（包括 commit），
 `~/.codex/config.toml` 要有 `approval_policy = "never"` 與 `sandbox_mode = "danger-full-access"`。
@@ -191,11 +192,13 @@ script 有兩種方式接上房間：
 | `/fiat` | 開始這個房間的專案的下一輪 |
 | `… -t yyyy-mm-dd HH:MM` | 從那個時間開始汲取對話（房間常常先亂聊很久） |
 | `… -go` | 一路做到裝好；已經開著就是請它接著實作 |
-| `… -claude`／`-codex` | 這一輪用哪一個 AI，不加就用設定的 `harness` |
+| `… -claude`／`-codex` | 這一輪用哪一個 AI。不加就用這個房間上次用的那一個，第一次用設定的 `harness` |
 | `/fiat ?` | 只查不做：綁了哪個專案、裝了什麼、AI 開著沒有 |
 | `/fiat -install [projname]` | 把專案裝進這個房間，馬上生效 |
 | `/fiat -uninstall` | 從這個房間拿掉，房間就可以綁別的專案 |
+| `/fiat -rename <newname>` | 專案目錄改名，AI 的記憶跟著搬（AI 開著的時候不行） |
 | `/fiat -done` | 驗收過了，請它收尾 |
+| `/fiat -abort` | 叫錯了：直接關掉，不 commit、不動 timestamp，下一輪還從同一個地方汲取 |
 
 - **一個房間一個專案。** 要換就 `/fiat -uninstall` 再 `/fiat -install <別的專案>`。
 - **一個房間一次一個 AI。** 開著的時候再打 `/fiat` 會被擋下來。
@@ -227,6 +230,8 @@ script 有兩種方式接上房間：
 | `fiat.interpreters` | 副檔名 → 直譯器 argv，給 `.mjs`/`.js`/`.cjs`/`.py` 以外的 script 用 |
 | `offstageLogFile` | AI 沒看到的話記在哪，預設 `~/.openclaw/logs/chat-interceptor-offstage.log` |
 | `debug`、`logFile` | 每一輪的判斷過程寫進 `logFile`（預設 `~/.openclaw/logs/chat-interceptor.log`） |
+
+每個檔案放在哪裡、讀哪些環境變數，見 [docs/FILES.md](docs/FILES.md)。
 
 ## 開發
 

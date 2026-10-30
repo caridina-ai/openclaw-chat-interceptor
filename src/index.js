@@ -19,7 +19,7 @@
 // 所有領域邏輯都在 script 裡，所有需要智力的判斷都在寫程式的 AI 那裡。
 
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,7 @@ import {
   HARNESSES,
   asAside,
   asideOf,
+  carry,
   deriveRoute,
   inject,
   installSkill,
@@ -50,6 +51,7 @@ import {
   sessionAlive,
   skillDirOf,
   tapFileOf,
+  writeIndex,
   writeTap,
 } from "./core.js";
 
@@ -80,7 +82,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^\d{2}:\d{2}(:\d{2})?$/;
 
 const FIAT_USAGE =
-  "Use /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go] [-claude|-codex], /fiat ?, /fiat -install [projname], /fiat -uninstall or /fiat -done.";
+  "Use /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go] [-claude|-codex], /fiat ?, /fiat -install [projname], /fiat -uninstall, /fiat -rename <newname>, /fiat -done or /fiat -abort.";
 
 /**
  * debug 為 true 時把每一輪的判斷寫進 logFile。
@@ -482,11 +484,14 @@ function aside(api, ctx) {
 //   /fiat ?                                        只查不做：這個房間綁了什麼、裝了什麼、session 開著沒有
 //   /fiat -install [projname]                      把專案的 skill 裝進 OpenClaw，並在這個房間上線
 //   /fiat -uninstall                               下線、拿掉裝上去的 skill，解除綁定
+//   /fiat -rename <newname>                        專案目錄改名，對照表跟著改
 //   /fiat -done                                    驗收過了：請它 commit、寫交接 memory
+//   /fiat -abort                                   叫錯了：直接關掉，不 commit、不動 timestamp
 //
 // 寫程式的 AI 是 Claude Code（ccrun 叫起）或 Codex（cdrun 叫起）。兩支程式介面一樣，
 // 所以這裡只有一張表（core.js 的 HARNESSES），沒有哪一段是專為其中一種寫的。
-// `-claude`／`-codex` 指定這一輪用哪一個，沒指定就用設定的 `fiat.harness`。
+// `-claude`／`-codex` 指定這一輪用哪一個。沒指定就用這個房間上一次用的那一個——使用者不必記得
+// 上次是怎麼叫起來的；這個房間從沒叫起過，才用設定的 `fiat.harness`。
 //
 // `-go` 只有一個意思：這個房間的專案，接下來一路自動做到裝好。還沒開 session 就叫起
 // 連續版（FIAT 文件寫好就替它注入 `go`）；已經開著——例如停在 FIAT 文件等人看——
@@ -502,13 +507,19 @@ function aside(api, ctx) {
 /** 叫起中的房間 → 叫起的是哪一種。runner 要等 session 真的能接話才回來，那段時間裡不能再叫一次。 */
 const starting = new Map();
 
-/** 這個房間的 session 已經沒了（或從沒有過）：對照表裡跟它有關的欄位一起清掉。 */
-const NO_SESSION = { harness: undefined, pid: undefined, go: undefined, closing: undefined };
+/** 叫起中、但使用者已經打了 `-abort` 的房間：一起來就關掉。 */
+const abortAfterStart = new Set();
+
+/**
+ * 這個房間的 session 已經沒了（或從沒有過）：對照表裡跟它有關的欄位一起清掉。
+ * `harness` 留著：下一輪沒指定的話，就叫上一次那一個。
+ */
+const NO_SESSION = { pid: undefined, go: undefined, closing: undefined };
 
 const isHarness = (key) => typeof key === "string" && Object.hasOwn(HARNESSES, key);
 
-/** 開著的 session 是哪一種；沒開著就是下一輪會叫的那一種（設定的預設）。 */
-const sessionHarness = (settings, entry) => (entry?.pid && isHarness(entry.harness) ? entry.harness : settings.harness);
+/** 開著的、或上一次叫起的是哪一種；這個房間從沒叫起過才是設定的預設。 */
+const sessionHarness = (settings, entry) => (isHarness(entry?.harness) ? entry.harness : settings.harness);
 const sessionLabel = (settings, entry) => HARNESSES[sessionHarness(settings, entry)].label;
 const sessionRunner = (settings, entry) => settings.runners[sessionHarness(settings, entry)];
 
@@ -555,7 +566,7 @@ function parseFiat(args) {
     } else if (isHarness(flag)) {
       if (parsed.harness && parsed.harness !== flag) return { error: `-${parsed.harness} and -${flag} do not go together.` };
       parsed.harness = flag;
-    } else if ((flag === "install" || flag === "uninstall" || flag === "done") && !parsed.verb) {
+    } else if (["install", "uninstall", "rename", "done", "abort"].includes(flag) && !parsed.verb) {
       parsed.verb = flag;
     } else {
       return { error: `unknown option "${token}". ${FIAT_USAGE}` };
@@ -563,7 +574,10 @@ function parseFiat(args) {
   }
   const { name, since, go, harness, verb } = parsed;
   if (verb === "install" && (since || go || harness)) return { error: "-install takes nothing but a project name." };
-  if ((verb === "uninstall" || verb === "done") && (name || since || go || harness)) return { error: `-${verb} takes no arguments.` };
+  if (verb === "rename" && (!name || since || go || harness)) return { error: "-rename takes the new name and nothing else: /fiat -rename <newname>" };
+  if ((verb === "uninstall" || verb === "done" || verb === "abort") && (name || since || go || harness)) {
+    return { error: `-${verb} takes no arguments.` };
+  }
   if (verb === "status" && (name || since || go || harness)) return { error: "? takes no arguments." };
   if (name && !PROJECT_RE.test(name)) {
     return { error: `"${name}" is not a usable project name (one path segment: letters, digits, dot, dash, underscore).` };
@@ -614,10 +628,13 @@ async function fiat(api, ctx) {
   // skill 裝進這個房間的 agent 的 workspace。房間沒有另外綁 agent 時，OpenClaw 給的是預設的那個。
   const settings = { ...base, agent: ctx?.agentId || entry?.agent || undefined };
   if (parsed.verb === "status") return { text: await status(config, settings, room, key, entry) };
+  // 叫錯了要馬上能收回，不必等它開好。
+  if (parsed.verb === "abort") return { text: await abort(settings, key, entry) };
   if (starting.has(key)) return { text: `fiat: ${starting.get(key)} for ${entry?.name ?? "this room"} is still starting.` };
 
   if (parsed.verb === "uninstall") return { text: await uninstall(config, settings, room, key, entry) };
   if (parsed.verb === "install") return { text: await install(settings, room, key, entry, parsed.name) };
+  if (parsed.verb === "rename") return { text: await rename(config, settings, entry, parsed.name) };
 
   const open = entry?.pid && (await sessionAlive(sessionRunner(settings, entry), entry.pid)) ? entry.pid : null;
   const label = sessionLabel(settings, entry);
@@ -652,7 +669,7 @@ async function status(config, settings, room, key, entry) {
     lines.push(`installed: ${entry.installed ? (entry.skill ?? entry.name) : "no"}`);
     const alive = entry.pid && (await sessionAlive(sessionRunner(settings, entry), entry.pid));
     const session = starting.has(key) ? "starting" : alive ? `pid ${entry.pid}${entry.closing ? ", closing" : ""}` : "not running";
-    lines.push(`${starting.get(key) ?? sessionLabel(settings, alive ? entry : null)}: ${session}`);
+    lines.push(`${starting.get(key) ?? sessionLabel(settings, entry)}: ${session}`);
     const tapFile = existsSync(entry.dir) ? tapFileOf(entry.dir) : null;
     lines.push(`timestamp: ${(tapFile && readTap(tapFile).timestamp) || "none"}`);
   }
@@ -677,8 +694,10 @@ function routeSkillName(route) {
  */
 async function close(settings, key, entry) {
   const label = sessionLabel(settings, entry);
-  const result = await quit(sessionRunner(settings, entry), entry.pid);
-  patchRoom(settings.projectsFile, key, NO_SESSION);
+  const runner = sessionRunner(settings, entry);
+  const result = await quit(runner, entry.pid);
+  // 關不掉、它還活著的話 pid 要留著：那是再試一次的把手，-rename 也靠它知道目錄還有人在用。
+  if (result.ok || !(await sessionAlive(runner, entry.pid))) patchRoom(settings.projectsFile, key, NO_SESSION);
   if (result.ok) return `fiat: ${label} for ${entry.name} is closed.`;
   return `fiat: could not close ${label} for ${entry.name} (pid ${entry.pid}): ${result.failure}`;
 }
@@ -705,6 +724,27 @@ function closeSoon(settings, key, entry, room) {
   }, grace).unref();
 }
 
+/**
+ * `/fiat -abort`：叫錯了（例如叫起了另一個 AI），收回這一輪。直接關掉 session：不請它 commit、
+ * 不寫交接 memory、不動 `.tap` 的 timestamp，下一輪還是從同一個地方汲取。它已經寫下的檔案留在專案目錄裡。
+ * 還在叫起中的，記下來，等它起來就關。
+ */
+async function abort(settings, key, entry) {
+  if (!entry) return "fiat: this room has no project.";
+  if (starting.has(key)) {
+    abortAfterStart.add(key);
+    return `fiat: ${starting.get(key)} for ${entry.name} is still starting. It will be closed as soon as it is up; the timestamp stays.`;
+  }
+  const label = sessionLabel(settings, entry);
+  if (!entry.pid || !(await sessionAlive(sessionRunner(settings, entry), entry.pid))) {
+    if (entry.pid) patchRoom(settings.projectsFile, key, NO_SESSION);
+    return `fiat: nothing to abort: ${label} for ${entry.name} is not running. The timestamp stays.`;
+  }
+  // 已經回報收尾、等著被關的那一輪（done 已經 commit 了）：只是提早關，不能說什麼都沒做。
+  const text = await close(settings, key, entry);
+  return /is closed\.$/.test(text) && !entry.closing ? `${text} Nothing was committed, and the timestamp stays.` : text;
+}
+
 async function ask(settings, entry, prompt, what) {
   const label = sessionLabel(settings, entry);
   const sent = await inject(sessionRunner(settings, entry), entry.pid, prompt);
@@ -714,7 +754,7 @@ async function ask(settings, entry, prompt, what) {
 
 /** `/fiat [projname] [-t …] [-go] [-claude|-codex]`：決定是哪個專案，然後叫起寫程式的 AI。 */
 function startRound(settings, room, key, entry, { name, since, go, harness }) {
-  harness ??= settings.harness;
+  harness ??= sessionHarness(settings, entry);
   let project;
   let created = false;
   if (name) {
@@ -765,7 +805,17 @@ function startRound(settings, room, key, entry, { name, since, go, harness }) {
   starting.set(key, label);
   launch(settings.runners[harness], project.dir, prompt).then(async (started) => {
     starting.delete(key);
+    const aborted = abortAfterStart.delete(key);
     if (started.pid && readIndex(settings.projectsFile)[key]?.name === project.name) {
+      if (aborted) {
+        const closed = await quit(settings.runners[harness], started.pid);
+        patchRoom(settings.projectsFile, key, NO_SESSION);
+        const text = closed.ok
+          ? `fiat: ${label} for ${project.name} is closed (-abort). Nothing was committed, and the timestamp stays.`
+          : `fiat: could not close ${label} for ${project.name} (pid ${started.pid}): ${closed.failure}`;
+        await notify(settings.openclaw, room, text);
+        return;
+      }
       patchRoom(settings.projectsFile, key, { pid: started.pid });
       return;
     }
@@ -844,6 +894,79 @@ async function uninstall(config, settings, room, key, entry) {
     open ? `Its ${sessionLabel(settings, entry)} session (pid ${open}) is still open.` : null,
     handWritten.length
       ? `Careful: openclaw.json still has a route for this room (${handWritten.join(", ")}). Remove it yourself and restart the gateway.`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/**
+ * `/fiat -rename <newname>`：把這個房間的專案目錄改名，對照表裡指著它的每一筆跟著改，
+ * 寫程式的 AI 為這個目錄記的東西也請 runner 搬過去（`-m`）——Claude Code 的交接 memory 是照目錄路徑存的，
+ * 不搬的話，下一輪就看不到前幾輪留下的經驗。沒裝的 runner 就是沒有東西可搬。
+ *
+ * 全部一起改，有一處跟不上就全部改回去：目錄、AI 的記憶與登錄對不上，比沒改還糟。
+ * `.tap` 在目錄裡，跟著走；裝進 OpenClaw 的那一份是另一份複製，名字取自它的 SKILL.md，都不必動。
+ * session 開著就不改：它的工作目錄就在裡面，Windows 上改不了名，改得了它也會找不到自己。
+ */
+async function rename(config, settings, entry, name) {
+  if (!entry) return "fiat: this room has no project to rename.";
+  if (name === entry.name) return `fiat: the project is already called ${name}.`;
+  if (!existsSync(entry.dir)) return `fiat: the project recorded for this room is gone: ${entry.dir}`;
+  const open = entry.pid && (await sessionAlive(sessionRunner(settings, entry), entry.pid)) ? entry.pid : null;
+  if (open) return `fiat: ${sessionLabel(settings, entry)} is still open for ${entry.name} (pid ${open}). Rename it once that session is closed.`;
+  const dir = join(dirname(entry.dir), name);
+  // 只差大小寫的話，Windows 上看到的就是它自己。
+  if (existsSync(dir) && !samePath(dir, entry.dir)) return `fiat: ${name} already exists.`;
+  try {
+    renameSync(entry.dir, dir);
+  } catch (error) {
+    const busy = error?.code === "EPERM" || error?.code === "EBUSY";
+    return `fiat: could not rename ${entry.name}: ${busy ? "something still has its folder open" : String(error?.message || error)}.`;
+  }
+  const carried = [];
+  let failure = "";
+  for (const [harness, { label }] of Object.entries(HARNESSES)) {
+    const moved = await carry(settings.runners[harness], entry.dir, dir);
+    if (moved.missing) continue;
+    if (!moved.ok) {
+      // 第一行就是原因；不認得 -m 的舊版 runner 會在後面附上整份用法。
+      failure = `${label}: ${moved.failure.split("\n")[0]}`;
+      break;
+    }
+    carried.push(harness);
+  }
+  if (!failure) {
+    const index = readIndex(settings.projectsFile);
+    for (const other of Object.values(index)) if (samePath(other?.dir, entry.dir)) Object.assign(other, { name, dir });
+    try {
+      writeIndex(settings.projectsFile, index);
+    } catch (error) {
+      failure = String(error?.message || error);
+    }
+  }
+  if (failure) {
+    // 先把目錄改回去，runner 才搬得回來：它只在目錄搬好之後搬。
+    const stuck = [];
+    try {
+      renameSync(dir, entry.dir);
+      for (const harness of carried.reverse()) {
+        if (!(await carry(settings.runners[harness], dir, entry.dir)).ok) stuck.push(HARNESSES[harness].label);
+      }
+    } catch (error) {
+      stuck.push(String(error?.message || error));
+    }
+    const undo = stuck.length ? ` Could not undo it all: ${stuck.join(", ")}.` : "";
+    return `fiat: could not rename ${entry.name}: ${failure}${undo}`;
+  }
+  // 手寫的 route 用專案名找目錄的話，改名之後就找不到了。它不歸這裡管，但要說。
+  const byName = (Array.isArray(config.routes) ? config.routes : []).filter(
+    (route) => route?.project === entry.name && !route.dir && !route.command?.length,
+  );
+  return [
+    `fiat: ${entry.name} is now ${name}.`,
+    byName.length
+      ? `Careful: openclaw.json has a route that finds it by name (${byName.map(routeLabel).join(", ")}). Change it to ${name} yourself and restart the gateway.`
       : null,
   ]
     .filter(Boolean)

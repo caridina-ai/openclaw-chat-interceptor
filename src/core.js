@@ -11,7 +11,8 @@ export const DEFAULT_OPENCLAW = ["openclaw"];
 
 /**
  * /fiat 叫得起的 AI harness，以及叫它們的程式。兩支程式的介面一模一樣：
- * `-d <dir> [prompt]` 開（印出 pid）、`-p <pid> <text>` 打字、`-p <pid> -s` 看、`-p <pid> -q` 關。
+ * `-d <dir> [prompt]` 開（印出 pid）、`-p <pid> <text>` 打字、`-p <pid> -s` 看、`-p <pid> -q` 關、
+ * `-m <舊目錄> <新目錄>` 目錄改名之後，把它為那個目錄記的東西搬過去。
  * 設定裡 `fiat.<runner>` 是它的 argv，沒設就在 PATH 上找。
  */
 export const HARNESSES = {
@@ -79,7 +80,7 @@ export const roomKey = (room) => `${lower(room.channel)}:${normalizeTarget(room.
 //   agent          這個房間的 OpenClaw agent，skill 裝進它的 workspace
 //   installed      裝上了：`installedDir` 是 OpenClaw 裡那一份上線版，route 跑的是它的 script
 //   skill          裝上去的 skill 名字
-//   harness        開著的那個 session 是哪一種 AI（HARNESSES 的 key）
+//   harness        上一次叫起的是哪一種 AI（HARNESSES 的 key）；開著的話就是它，下一輪沒指定也叫它
 //   pid            開著的 session（ccrun／cdrun 的把手）
 //   token          這一輪的回報憑證：回報程式拿它找到這一筆，舊 session 拿不到新一輪的
 //   go             這一輪是不是連續版：FIAT 文件寫好，回報程式就注入 `go`
@@ -96,13 +97,18 @@ export function readIndex(file) {
   }
 }
 
-/** 改一筆；`patch` 是 null 就整筆拿掉。值是 undefined 的欄位寫出去時自然消失。 */
+/** 整張表寫回去。值是 undefined 的欄位寫出去時自然消失。 */
+export function writeIndex(file, index) {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(index, null, 2)}\n`, "utf8");
+}
+
+/** 改一筆；`patch` 是 null 就整筆拿掉。 */
 export function patchRoom(file, key, patch) {
   const index = readIndex(file);
   if (patch === null) delete index[key];
   else index[key] = { ...(index[key] ?? {}), ...patch };
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, `${JSON.stringify(index, null, 2)}\n`, "utf8");
+  writeIndex(file, index);
   return index[key] ?? null;
 }
 
@@ -306,7 +312,7 @@ export function deriveRoute(interpreters, project) {
 // 外部指令：送訊息、叫 ccrun／cdrun
 // ---------------------------------------------------------------------------
 
-/** 跑一支外部指令，永遠 resolve：`ok` 是它有沒有乾淨地結束。 */
+/** 跑一支外部指令，永遠 resolve：`ok` 是它有沒有乾淨地結束，`missing` 是根本沒有這支程式。 */
 export function run([command, ...args], extra = [], { timeout = 60_000, env } = {}) {
   return new Promise((resolve) => {
     const child = execFile(
@@ -316,6 +322,7 @@ export function run([command, ...args], extra = [], { timeout = 60_000, env } = 
       (error, stdout, stderr) => {
         resolve({
           ok: !error,
+          missing: error?.code === "ENOENT",
           stdout: String(stdout ?? "").trim(),
           failure: error ? String(stderr || error.message || error).trim() : "",
         });
@@ -376,6 +383,12 @@ export const inject = (runner, pid, text) => run(runner, ["-p", String(pid), tex
  * 只能從 session **外面**叫：它會等 session 結束。
  */
 export const quit = (runner, pid) => run(runner, ["-p", String(pid), "-q"]);
+
+/**
+ * 目錄已經從 from 改名成 to 之後，請 runner 把它的 AI 為那個目錄記的東西搬過去
+ * （Claude Code 的交接 memory 與對話紀錄就是照目錄路徑存的）。搬什麼是 runner 的事。
+ */
+export const carry = (runner, from, to) => run(runner, ["-m", from, to]);
 
 /** 那個 pid 還是不是一個開著的 session。runner 會順便確認它是自己叫起的那一種。 */
 export async function sessionAlive(runner, pid) {

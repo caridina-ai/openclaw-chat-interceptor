@@ -2,7 +2,7 @@
   "id": "openclaw-chat-interceptor",
   "name": "Chat Interceptor",
   "description": "Runs a per-room script before the agent replies; falls through to the AI when the script declines.",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "activation": {
     "onStartup": true,
     "onCapabilities": [

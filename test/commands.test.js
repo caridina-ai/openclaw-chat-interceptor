@@ -199,6 +199,18 @@ describe("/fiat", () => {
   /** /fiat 叫起 Claude Code 是背景跑的：等 pid 記進對照表才算叫起來了。 */
   const started = () => waitFor(() => entry()?.pid, "Claude Code to start");
 
+  /** 房間裡的一句話，經過攔截 hook。 */
+  const hookCtx = () => ({
+    channelId: "telegram",
+    conversationId: TELEGRAM_CHAT,
+    sessionKey: `telegram:group:${TELEGRAM_CHAT}`,
+    pluginConfig: { ...settings(), routes: [] },
+  });
+  const say = async (body) => {
+    const result = await hook({ body, channel: "telegram" }, hookCtx());
+    return result?.text ? { ...result, text: unmark(result.text) } : result;
+  };
+
   beforeEach(() => {
     seq += 1;
     projects = mkdtempSync(join(dir, "projects-"));
@@ -214,6 +226,8 @@ describe("/fiat", () => {
     delete process.env.RUNNER_ALIVE;
     delete process.env.RUNNER_FAIL;
     delete process.env.RUNNER_DELAY;
+    delete process.env.RUNNER_MOVE_FAIL;
+    delete process.env.RUNNER_QUIT_FAIL;
   });
 
   it("says so when the fiat block is missing", async () => {
@@ -383,6 +397,23 @@ describe("/fiat", () => {
       assert.equal(await waitFor(() => entry()?.pid === 4242 && 4242, "the new session"), 4242);
     });
 
+    // 看到叫錯了就能收回，不必等它開好。
+    it("-abort while it is still starting closes it as soon as it is up", async () => {
+      process.env.RUNNER_DELAY = "400";
+      process.env.RUNNER_ALIVE = "4242";
+      await reply("ledger");
+      assert.equal(
+        await reply("-abort"),
+        "fiat: Claude Code for ledger is still starting. It will be closed as soon as it is up; the timestamp stays.",
+      );
+      await waitFor(() => calls("quit").length, "the session to be closed");
+      assert.deepEqual(calls("quit"), [{ runner: "ccrun", mode: "quit", pid: 4242 }]);
+      const [notice] = await waitFor(() => readJsonLines(notifyLog).length && readJsonLines(notifyLog), "the notice");
+      assert.equal(unmark(notice[5]), "fiat: Claude Code for ledger is closed (-abort). Nothing was committed, and the timestamp stays.");
+      assert.equal(entry().pid, undefined);
+      assert.equal(entry().harness, "claude");
+    });
+
     it("says so while Claude Code is still starting", async () => {
       process.env.RUNNER_DELAY = "400";
       await reply("ledger");
@@ -419,6 +450,32 @@ describe("/fiat", () => {
         assert.match(await reply("ledger -claude -go", { config }), /^fiat: starting Claude Code for ledger \(new project, -go\)/);
         await started();
         assert.equal(calls("launch")[0].runner, "ccrun");
+      });
+
+      // 使用者不必記得上次是怎麼叫起來的：沒指定就叫這個房間上一次那一個，設定的預設只管第一次。
+      it("starts the AI the room used last time", async () => {
+        mkdirSync(join(projects, "ledger"), { recursive: true });
+        setEntry({ name: "ledger", dir: join(projects, "ledger"), harness: "codex" });
+        assert.match(await reply(""), /^fiat: starting Codex for ledger: \/tap\. /);
+        await started();
+        assert.equal(calls("launch")[0].runner, "cdrun");
+      });
+
+      it("remembers an explicit choice for the next round", async () => {
+        mkdirSync(join(projects, "ledger"), { recursive: true });
+        setEntry({ name: "ledger", dir: join(projects, "ledger"), harness: "codex" });
+        await reply("-claude");
+        await started();
+        // 這一輪收尾、session 關掉之後，記得的是這一次用的那一個。
+        process.env.RUNNER_ALIVE = "4242";
+        setEntry({ ...entry(), closing: true });
+        assert.equal(await reply("-done"), "fiat: Claude Code for ledger is closed.");
+        assert.equal(entry().pid, undefined);
+        assert.equal(entry().harness, "claude");
+        delete process.env.RUNNER_ALIVE;
+        await reply("");
+        await started();
+        assert.deepEqual(calls("launch").map((call) => call.runner), ["ccrun", "ccrun"]);
       });
 
       it("talks to an open session through the runner that started it", async () => {
@@ -468,6 +525,8 @@ describe("/fiat", () => {
       process.env.RUNNER_ALIVE = "4242";
       assert.match(await reply("?"), /\nCodex: pid 4242\n/);
       delete process.env.RUNNER_ALIVE;
+      assert.match(await reply("?"), /\nCodex: not running\n/, "the one it used last time");
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
       assert.match(await reply("?"), /\nClaude Code: not running\n/);
       assert.match(await reply("?", { config: settings({ harness: "codex" }) }), /\nCodex: not running\n/);
     });
@@ -537,6 +596,42 @@ describe("/fiat", () => {
       assert.equal(entry().pid, undefined);
     });
 
+    // 叫錯了（例如叫起了另一個 AI）：直接關掉，不請它 commit，timestamp 不動。
+    it("-abort closes it without wrapping up", async () => {
+      const tap = seed("ledger", `channel:   telegram\ntarget:    ${TELEGRAM_CHAT}\ntimestamp: 2026-10-01 09:00:00\n`);
+      setEntry({ ...entry(), harness: "claude", go: true });
+      assert.equal(await reply("-abort"), "fiat: Claude Code for ledger is closed. Nothing was committed, and the timestamp stays.");
+      assert.deepEqual(calls("quit"), [{ runner: "ccrun", mode: "quit", pid: 4242 }]);
+      assert.deepEqual(calls("inject"), [], "no /tap -done");
+      assert.match(readFileSync(tap, "utf8"), /timestamp: 2026-10-01 09:00:00/);
+      assert.deepEqual(entry(), { name: "ledger", dir: join(projects, "ledger"), harness: "claude" });
+    });
+
+    it("-abort says there is nothing to abort when no session is open, and forgets the stale pid", async () => {
+      delete process.env.RUNNER_ALIVE;
+      assert.equal(await reply("-abort"), "fiat: nothing to abort: Claude Code for ledger is not running. The timestamp stays.");
+      assert.deepEqual(calls("quit"), []);
+      assert.equal(entry().pid, undefined);
+    });
+
+    // 真的發生過：-q 失敗，pid 卻被清掉，session 變成沒人管的孤兒，-rename 也擋不住，把它的目錄改掉了。
+    it("-abort keeps hold of a session it could not close", async () => {
+      process.env.RUNNER_QUIT_FAIL = "ccrun: cannot close";
+      assert.equal(await reply("-abort"), "fiat: could not close Claude Code for ledger (pid 4242): ccrun: cannot close");
+      assert.equal(entry().pid, 4242);
+      assert.match(await reply("-rename books"), /is still open for ledger \(pid 4242\)/);
+      delete process.env.RUNNER_QUIT_FAIL;
+      assert.equal(await reply("-abort"), "fiat: Claude Code for ledger is closed. Nothing was committed, and the timestamp stays.");
+      assert.equal(entry().pid, undefined);
+    });
+
+    // 回報 done 之後等著被關的那一輪已經 commit 了：提早關可以，但不能說什麼都沒 commit。
+    it("-abort does not deny the work of a round that already wrapped up", async () => {
+      setEntry({ ...entry(), closing: true });
+      assert.equal(await reply("-abort"), "fiat: Claude Code for ledger is closed.");
+      assert.deepEqual(calls("quit"), [{ runner: "ccrun", mode: "quit", pid: 4242 }]);
+    });
+
     // 連續版：沒有 session 開著時，-go 是「維護舊專案，一路做到裝好」。
     it("-go starts a continuous round when no session is open", async () => {
       delete process.env.RUNNER_ALIVE;
@@ -550,17 +645,6 @@ describe("/fiat", () => {
   // 上線與下線只動對照表，所以**當場生效**：plugin config 不會 hot reload，
   // 寫進 openclaw.json 的話要重啟 gateway 才算數。
   describe("-install / -uninstall", () => {
-    const hookCtx = () => ({
-      channelId: "telegram",
-      conversationId: TELEGRAM_CHAT,
-      sessionKey: `telegram:group:${TELEGRAM_CHAT}`,
-      pluginConfig: { ...settings(), routes: [] },
-    });
-    const say = async (body) => {
-      const result = await hook({ body, channel: "telegram" }, hookCtx());
-      return result?.text ? { ...result, text: unmark(result.text) } : result;
-    };
-
     // 這是一個真實踩到的 bug 的回歸測試：回話說裝好了，但下一則訊息還是走舊的。
     it("takes effect on the very next message", async () => {
       seed("ledger", here);
@@ -738,13 +822,113 @@ describe("/fiat", () => {
     });
   });
 
+  // 改名動的是目錄、AI 為它記的東西（runner 的 -m）與對照表：.tap 跟著目錄走，
+  // 裝上去的那一份是另一份複製，照樣跑。
+  describe("-rename", () => {
+    const moves = () => calls("move").map(({ runner, from, to }) => [runner, from, to]);
+
+    it("renames the folder and every registration that points at it", async () => {
+      seed("ledger", here);
+      seedProject("ledger");
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
+      await reply("-install");
+      const elsewhere = `telegram:${OTHER_CHAT}`;
+      writeFileSync(projectsFile, JSON.stringify({ ...readIndex(), [elsewhere]: { name: "ledger", dir: join(projects, "ledger") } }), "utf8");
+
+      assert.equal(await reply("-rename books"), "fiat: ledger is now books.");
+      assert.equal(existsSync(join(projects, "ledger")), false);
+      assert.equal(readFileSync(join(projects, "books", "genesis", ".tap"), "utf8"), here);
+      const [from, to] = [join(projects, "ledger"), join(projects, "books")];
+      assert.deepEqual(moves(), [["ccrun", from, to], ["cdrun", from, to]]);
+      assert.equal(entry().name, "books");
+      assert.equal(entry().dir, join(projects, "books"));
+      assert.deepEqual(readIndex()[elsewhere], { name: "books", dir: join(projects, "books") });
+      assert.equal(entry().installedDir, installedDir("ledger"));
+      assert.equal((await say("hi")).text, "ledger says hi");
+      assert.equal(await reply("?"), "project: books\ninstalled: ledger\nClaude Code: not running\ntimestamp: none");
+    });
+
+    it("starts the next round in the renamed folder", async () => {
+      seed("ledger", here);
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
+      await reply("-rename books");
+      assert.match(await reply(""), /^fiat: starting Claude Code for books: \/tap\./);
+      await started();
+      assert.ok(samePath(calls("launch")[0].dir, join(projects, "books")));
+    });
+
+    it("puts everything back when a runner cannot carry its data over", async () => {
+      seed("ledger", here);
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
+      process.env.RUNNER_MOVE_FAIL = "cdrun";
+      assert.equal(await reply("-rename books"), "fiat: could not rename ledger: Codex: cdrun: cannot move");
+      assert.ok(existsSync(join(projects, "ledger")));
+      assert.equal(existsSync(join(projects, "books")), false);
+      assert.deepEqual(entry(), { name: "ledger", dir: join(projects, "ledger") });
+      const [from, to] = [join(projects, "ledger"), join(projects, "books")];
+      assert.deepEqual(moves(), [["ccrun", from, to], ["cdrun", from, to], ["ccrun", to, from]]);
+    });
+
+    it("skips a runner that is not installed", async () => {
+      seed("ledger", here);
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
+      const config = settings({ cdrun: [join(dir, "no-such-cdrun.exe")] });
+      assert.equal(await reply("-rename books", { config }), "fiat: ledger is now books.");
+      assert.deepEqual(moves(), [["ccrun", join(projects, "ledger"), join(projects, "books")]]);
+    });
+
+    it("waits until the session is closed", async () => {
+      seed("ledger", here);
+      setEntry({ name: "ledger", dir: join(projects, "ledger"), pid: 4242 });
+      process.env.RUNNER_ALIVE = "4242";
+      assert.equal(
+        await reply("-rename books"),
+        "fiat: Claude Code is still open for ledger (pid 4242). Rename it once that session is closed.",
+      );
+      assert.ok(existsSync(join(projects, "ledger")));
+      assert.equal(entry().name, "ledger");
+    });
+
+    it("refuses a name that is taken", async () => {
+      seed("ledger", here);
+      mkdirSync(join(projects, "books"));
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
+      assert.equal(await reply("-rename books"), "fiat: books already exists.");
+      assert.ok(existsSync(join(projects, "ledger")));
+      assert.equal(entry().name, "ledger");
+    });
+
+    it("says so when there is nothing to rename", async () => {
+      assert.equal(await reply("-rename books"), "fiat: this room has no project to rename.");
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
+      assert.match(await reply("-rename books"), /^fiat: the project recorded for this room is gone: /);
+      seed("ledger", here);
+      assert.equal(await reply("-rename ledger"), "fiat: the project is already called ledger.");
+    });
+
+    it("warns about a hand-written route that finds the project by name", async () => {
+      seed("ledger", here);
+      setEntry({ name: "ledger", dir: join(projects, "ledger") });
+      const config = { ...settings(), routes: [{ channel: "telegram", target: OTHER_CHAT, project: "ledger" }] };
+      assert.equal(
+        await reply("-rename books", { config }),
+        "fiat: ledger is now books. Careful: openclaw.json has a route that finds it by name (ledger). Change it to books yourself and restart the gateway.",
+      );
+    });
+  });
+
   describe("arguments", () => {
     for (const [args, expected] of [
       ["-rf", /^fiat: unknown option "-rf"\. Use \/fiat /],
       ["-install -go", /^fiat: -install takes nothing but a project name\.$/],
       ["-done now", /^fiat: -done takes no arguments\.$/],
       ["-uninstall -go", /^fiat: -uninstall takes no arguments\.$/],
+      ["-abort ledger", /^fiat: -abort takes no arguments\.$/],
+      ["-done -abort", /^fiat: unknown option "-abort"/],
       ["-install -done", /^fiat: unknown option "-done"/],
+      ["-rename", /^fiat: -rename takes the new name and nothing else: \/fiat -rename <newname>$/],
+      ["-rename books -go", /^fiat: -rename takes the new name and nothing else/],
+      ["-rename ../evil", /is not a usable project name/],
       ["ledger other", /^fiat: unexpected "other"\./],
       ["-t", /^fiat: -t needs a start: -t yyyy-mm-dd HH:MM$/],
       ["ledger -t 2026-9-1", /^fiat: -t needs a start/],

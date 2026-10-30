@@ -68,6 +68,12 @@
 
 /fiat -uninstall  某些情況下，要解除本頻道與原本專案的連結關係
 
+/fiat -rename newname  把專案子目錄改名，並把登錄也更新
+
+/fiat -abort  不小心叫錯了（例如叫起了另一個 AI），把它關掉。和 -done 不同，它不會 commit，也不會更動 timestamp
+
+不管用 /fiat、/fiat -claude 還是 /fiat -codex 叫起來，都要記得這次用的是 ccrun 還是 cdrun。以後只打 /fiat 的時候就叫上次那一個，我不必去記上次是怎麼叫起來的。只有第一次叫起（建立專案）的那次讀設定的預設值
+
 ### /fiat [projname] [-t yyyy-mm-dd HH:MM] [-go]
 
 符合此模式的指令都會以 ccrun 叫起 Claude Code，並注入 `/tap [yyyy-mm-dd HH:MM]` 要求 Claude 汲取聊天紀錄，產生 FIATLUX.md 或  FIAT-{slug}.md

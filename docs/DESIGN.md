@@ -150,7 +150,8 @@ openclaw-chat-interceptor/
 ├── genesis/                    # 本專案的委託書：FIATLUX.md 與後續的 FIAT-*.md
 └── docs/
     ├── AUTHORING.md            # 給 script 作者
-    └── DESIGN.md               # 本檔
+    ├── DESIGN.md               # 本檔
+    └── FILES.md                # 讀寫哪些檔案、放在哪裡，讀哪些環境變數
 ```
 
 **這個 repo 不含任何 script。** plugin 是通用的路由器，領域邏輯一律屬於各自的
@@ -424,12 +425,14 @@ AI 只會收到固定的 `/tap [起點]`、`go`、`/tap -done`，完全不需要
 
 寫程式的 AI 有兩種：Claude Code（[ccrun](https://github.com/neritina-ai/cli-ccrun) 叫起）與
 Codex（[cdrun](https://github.com/caridina-ai/cli-cdrun) 叫起）。兩支程式的介面一模一樣——
-`-d <dir> [prompt]` 開並印出 pid、`-p <pid> <text>` 打字、`-p <pid> -s` 看、`-p <pid> -q` 關——
+`-d <dir> [prompt]` 開並印出 pid、`-p <pid> <text>` 打字、`-p <pid> -s` 看、`-p <pid> -q` 關、
+`-m <舊目錄> <新目錄>` 目錄改名之後把它為那個目錄記的東西搬過去——
 所以 plugin 裡只有一張表（`core.js` 的 `HARNESSES`：名字與程式），**沒有哪一段程式是專為其中一種寫的**。
 相容性不夠的地方改 runner，不在 plugin 裡分支。
 
-`-claude`／`-codex` 指定這一輪叫哪一個，沒指定就用設定的 `fiat.harness`（再沒有就是 Claude Code）。
-叫起之後對照表記下 `harness`，之後的 `-go`、`-done`、`?`、關 session 都用同一支 runner。
+`-claude`／`-codex` 指定這一輪叫哪一個。沒指定就叫這個房間上一次那一個，使用者不必記得上次是怎麼叫起來的；
+這個房間從沒叫起過，才用設定的 `fiat.harness`（再沒有就是 Claude Code）。叫起之後對照表記下 `harness`，
+session 關掉也留著；之後的 `-go`、`-done`、`-abort`、`?`、關 session 都用同一支 runner。
 
 **`-go` 只有一個意思：這個房間的專案，接下來一路自動做到裝好。** 還沒開 session 就是連續版；
 已經開著（例如停在 FIAT 文件等人看），就注入 `go` 請它接著做。主述者也可以在手機上直接打 `go`
@@ -452,8 +455,10 @@ Codex（[cdrun](https://github.com/caridina-ai/cli-cdrun) 叫起）。兩支程�
 | `… -claude`／`-codex` | 這一輪用哪一個 |
 | `/fiat -go` | session 開著：注入 `go`。沒開：連續版（上一列） |
 | `/fiat -done` | 注入 `/tap -done` |
+| `/fiat -abort` | 叫錯了：直接關掉 session（`-q`），不注入 `/tap -done`、不動 `timestamp`。還在叫起中的，起來就關 |
 | `/fiat -install [projname]` | `openclaw skills install` 把專案的 skill 裝進這個房間的 agent，對照表記下裝上去的那一份 |
 | `/fiat -uninstall` | 清掉對照表那一筆，拿掉裝上去的 skill |
+| `/fiat -rename <newname>` | 專案目錄改名，每一支 runner `-m` 搬它的 AI 為這個目錄記的東西，對照表裡指著它的每一筆跟著改 |
 
 前兩列（加上沒開 session 時的 `-go`）合流之後做同一件事：`<runner> -d <專案目錄> "/tap [起點]"`，
 其他什麼都不帶。runner 回傳的 pid 記進對照表，那就是之後 `-go`、`-done` 與關 session 的把手。
@@ -533,6 +538,16 @@ plugin 註冊的 HTTP 路由 `/chat-interceptor/report`，其餘的事都在 gat
 
 - **`-uninstall` 會把裝上去的那一份拿掉**，否則它還會出現在這個 agent 的每一個房間。
   只刪 `…/skills/<名字>` 這種位置；開發目錄一個檔案都不動。
+
+- **`-rename` 連 AI 的記憶一起搬，而且全有或全無。** Claude Code 的交接 memory 是照目錄路徑存的，
+  不搬的話，下一輪就看不到前幾輪留下的經驗。搬什麼是 runner 的事（`-m`，只在目錄搬好之後搬）；
+  沒裝的 runner 跳過。目錄、runner、對照表有一處跟不上，就全部改回去。
+  `.tap` 在目錄裡，跟著走；裝上去的那一份是複製，skill 名取自它的 SKILL.md，跟目錄名無關，照樣跑。
+  session 開著就不改：它的工作目錄就在裡面。各登錄的位置見 [FILES.md](FILES.md)。
+
+- **`-abort` 與 `-done` 不一樣：不注入、不 commit、不動 `timestamp`。** 叫錯了要馬上能收回，所以叫起中也收得回來：
+  記下來，等它起來就關。`-q` 失敗而且它還活著的話 pid 留著：那是再試一次的把手，`-rename` 也靠它知道目錄還有人在用。
+  額度用完的 Codex 就是這樣：`/tap -done` 跑不動，session 一直開著，只有 `-abort` 關得掉。
 
 - **起點一定要帶 `-t`。** `/fiat 2026-09-28` 分不出是起點還是一個專案名。忘了帶的時候
   回話直接給出補好的那一句，而不是一句「看不懂」。
