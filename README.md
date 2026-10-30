@@ -15,8 +15,13 @@
 需要 OpenClaw 2026.9.6 以上（要有 `before_dispatch` hook）。
 
 ```bash
-openclaw plugins install git:github.com/caridina-ai/openclaw-chat-interceptor
+openclaw gateway stop
+openclaw plugins install git:github.com/caridina-ai/openclaw-chat-interceptor --accept-capabilities
+openclaw gateway start
 ```
+
+要先停 gateway：OpenClaw 2026.10.8 實測，gateway 開著時從 git 裝，它可能自己停掉而且起不來。
+`--accept-capabilities` 是同意外掛使用的權限，少了它外掛不會裝上。非互動的 shell 裡，`stop` 與 `install` 都要再加 `--force`。
 
 ### 要用 `/fiat` 才需要
 
@@ -92,8 +97,9 @@ openclaw config set channels.discord.slashCommand.ephemeral false
 ### 更新
 
 ```bash
-openclaw plugins update openclaw-chat-interceptor
-openclaw gateway restart
+openclaw gateway stop
+openclaw plugins install git:github.com/caridina-ai/openclaw-chat-interceptor --force --accept-capabilities
+openclaw gateway start
 ```
 
 ## 攔截：給房間一支 script
