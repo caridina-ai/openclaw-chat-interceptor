@@ -5,3 +5,6 @@ node_modules/
 
 # 交給本尊驗收、執行的東西，不進版控
 altar/
+
+# npm run dist 打包的安裝檔
+dist/
