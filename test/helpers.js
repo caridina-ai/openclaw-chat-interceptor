@@ -67,8 +67,8 @@ export function register({ config = { channels: { telegram: {}, discord: {} } } 
   };
   entry.register(api);
   assert.ok(hooks.before_dispatch, "before_dispatch handler was not registered");
-  assert.deepEqual(Object.keys(hooks), ["before_dispatch"]);
-  return { hook: hooks.before_dispatch, commands, routes, api };
+  assert.deepEqual(Object.keys(hooks), ["before_dispatch", "before_prompt_build"]);
+  return { hook: hooks.before_dispatch, promptHook: hooks.before_prompt_build, commands, routes, api };
 }
 
 /** 這個 plugin 送出去的每一則開頭都帶記號：驗過再拿掉，其餘的測試只看內容。 */
@@ -196,6 +196,11 @@ export function fakeOpenclaw(dir) {
     if (args[0] === "message" && args[1] === "read") {
       const opt = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
       if (process.env.HISTORY_LOG) fs.appendFileSync(process.env.HISTORY_LOG, JSON.stringify(args.slice(2)) + "\\n", "utf8");
+      if (process.env.FAKE_HISTORY_JSON_ERROR) {
+        process.stdout.write(JSON.stringify({ok:false,error:{message:process.env.FAKE_HISTORY_JSON_ERROR}}));
+        process.stderr.write('[openclaw] For help, run openclaw doctor.');
+        process.exit(1);
+      }
       if (process.env.FAKE_HISTORY_ERROR) {
         process.stderr.write("[openclaw] The CLI command failed.\\n[openclaw] Reason: Error: " + process.env.FAKE_HISTORY_ERROR + "\\n[openclaw] Try: openclaw doctor\\n");
         process.exit(1);

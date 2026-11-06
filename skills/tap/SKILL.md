@@ -26,7 +26,7 @@ node <這份 SKILL.md 所在的目錄>/report.mjs <fiat|empty|built|done> "<給�
 
    - 房間讀 `genesis/.tap`（`channel` / `target` / `timestamp`）。`timestamp` 是上一輪結束的時間，汲取從那裡開始；空的就是從頭。
    - `/tap` 後面帶了時間，就用 `--since` 把起點改成那個時間。
-   - 平台讀得到歷史（例如 Discord）就以平台為準，一頁要半分鐘，指令的 timeout 給到 10 分鐘；讀不到（例如 Telegram）就只有 OpenClaw 在本機的紀錄。
+   - 平台讀得到歷史（例如 Discord）就以平台為準，一頁要半分鐘，指令的 timeout 給到 10 分鐘。Telegram 不提供伺服器歷史回溯：程式會唯讀合併 OpenClaw 保留的已接收群組訊息、session 與 offstage 紀錄，不透過需要群組身分的 `message read` CLI；`retainedTelegram` 說明讀取狀況，仍不代表完整平台歷史。需要支援 `node:sqlite` 的 Node.js 才能讀保留訊息。
    - 輸出依序是：`/aside`（房間裡特地留下、誰都不處理的話，整段列出；標著「機器人」的是其他機器人只給人看的訊息）；逐字稿，每一則是 `時間　#id 發話者：內容`，AI 與其他機器人的回應也在裡面，AI 沒看到的那些底下有一行 `↳` 說明下場（script 接走、script 出錯、/aside）；最後是涵蓋範圍。太長就用 `--since` 分段讀。
    - 什麼都沒汲取到，或輸出警告看不到這個房間的對話，就不寫 FIAT 文件：回報 `empty "<汲取到什麼、為什麼沒寫>"`，然後停下來。
 

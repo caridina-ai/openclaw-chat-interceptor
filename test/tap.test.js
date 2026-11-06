@@ -177,7 +177,7 @@ describe("tap.mjs", () => {
     assert.deepEqual(coverage.idRange, [9, 12]);
     assert.equal(coverage.missing, 0);
     assert.deepEqual(coverage.missingIds, []);
-    assert.match(coverage.platform.error, /^cannot reach the OpenClaw gateway/);
+    assert.match(coverage.platform.reason, /Telegram 不提供伺服器歷史/);
     assert.equal(coverage.localRecords, true);
   });
 
@@ -404,7 +404,7 @@ describe("tap.mjs with the platform's history", () => {
       assert.equal(json.code, 3);
       const { warning, coverage } = JSON.parse(json.stdout);
       assert.match(warning, /本機沒有這個房間的任何紀錄/);
-      assert.match(coverage.platform.error, /^Error: Telegram history read requires/);
+      assert.match(coverage.platform.reason, /Telegram 不提供伺服器歷史/);
       assert.equal(coverage.missing, null);
       assert.equal(coverage.missingIds, null);
 
@@ -442,5 +442,13 @@ describe("tap.mjs with the platform's history", () => {
     assert.equal((await fetch(history.url, { method: "POST", headers: { "content-type": "text/plain" }, body })).status, 403);
     const crossSite = { "content-type": "application/json", origin: "https://example.com" };
     assert.equal((await fetch(history.url, { method: "POST", headers: crossSite, body })).status, 403);
+  });
+
+  it('preserves structured CLI errors instead of the final doctor hint', async () => {
+    process.env.FAKE_HISTORY_JSON_ERROR = 'The requested history is unavailable';
+    try {
+      const response = await fetch(history.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({channel:'discord',target:DISCORD_CHAT})});
+      assert.equal((await response.json()).error,'The requested history is unavailable');
+    } finally { delete process.env.FAKE_HISTORY_JSON_ERROR; }
   });
 });

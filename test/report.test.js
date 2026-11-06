@@ -227,6 +227,22 @@ describe("built", () => {
     assert.match(result.stdout, /^not installed: .* has no skill yet/);
   });
 
+  it("reports an identical official install without replacing the live skill", async () => {
+    seedScript();
+    setEntry({ agent: 'main' });
+    await report(['built', 'First install']);
+    const target = entry().installedDir;
+    const before = readFileSync(join(target, 'scripts', 'intercept.mjs'), 'utf8');
+    process.env.FAKE_INSTALL_EPERM = '1';
+    try {
+      assert.equal((await report(['built', 'Same content'])).stdout, 'installed; reported to the room.');
+    } finally { delete process.env.FAKE_INSTALL_EPERM; }
+    assert.equal(readFileSync(join(target, 'scripts', 'intercept.mjs'), 'utf8'), before);
+    writeFileSync(join(project, 'ledger', 'scripts', 'intercept.mjs'), before + '\n// Updated source\n');
+    await report(['built', 'Changed content']);
+    assert.equal(readFileSync(join(target, 'scripts', 'intercept.mjs'), 'utf8'), before + '\n// Updated source\n');
+  });
+
   it("is the same in a continuous round", async () => {
     seedScript();
     setEntry({ go: true });

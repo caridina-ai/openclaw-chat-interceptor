@@ -38,11 +38,22 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import * as zlib from "node:zlib";
 import { gatewayUrl } from "./gateway.mjs";
+import { readTelegramHistory } from "./telegram-history.mjs";
 
 // ---------------------------------------------------------------------------
 // 參數與 .tap
 // ---------------------------------------------------------------------------
 const argv = process.argv.slice(2);
+const valueOptions = new Set(['tap', 'channel', 'target', 'since', 'format', 'agent', 'offstage']);
+for (let i = 0; i < argv.length; i++) {
+  const key = argv[i].slice(2);
+  if (argv[i] === '--help' || argv[i] === '--h') continue;
+  if (!argv[i].startsWith('--') || !valueOptions.has(key) || argv[i + 1] === undefined || argv[i + 1].startsWith('--')) {
+    console.error(`Unknown argument or missing value: ${argv[i]}`);
+    process.exit(2);
+  }
+  i++;
+}
 const arg = (name, fallback) => {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && argv[i + 1] !== undefined && !argv[i + 1].startsWith("--") ? argv[i + 1] : fallback;
@@ -104,6 +115,7 @@ const agentsDir = join(stateDir, "agents");
 const offstagePath = arg("offstage", join(stateDir, "logs", "chat-interceptor-offstage.log"));
 const onlyAgent = arg("agent");
 const format = arg("format", "md");
+if (!['md', 'json'].includes(format)) { console.error('--format must be md or json'); process.exit(2); }
 
 // ---------------------------------------------------------------------------
 // 時間
@@ -132,7 +144,7 @@ const stampMs = (stamp) => new Date(String(stamp).replace(" ", "T")).getTime();
 // ---------------------------------------------------------------------------
 // target 正規化：telegram 是裸 id，discord 是 channel:<id>，sessionKey 是
 // agent:<id>:<channel>:<group|channel>:<rawId>。統一剝到裸 id 再比對。
-const bareTarget = String(target).replace(/^(?:[a-z-]+:)*?([^:]+)$/i, "$1");
+const bareTarget = String(target).replace(channel === 'telegram' ? /^telegram:/i : /^(?:[a-z-]+:)*?([^:]+)$/i, channel === 'telegram' ? '' : '$1');
 const CHAT_TAG = `${channel}:${bareTarget}`; // prompt metadata 裡的 chat_id
 const KEY_RE = new RegExp(
   `^(?:agent:([^:]+):)?${channel}:(?:group|channel|thread|dm|direct|user|chat):` +
@@ -146,10 +158,10 @@ const senderNames = new Map(); // sender id -> 顯示名稱，給 offstage 那�
 /** Telegram 的 id 是小整數；Discord 的、按鍵的偽 id 超過 Number 的精度，留字串。 */
 const asId = (value) => (Number.isSafeInteger(Number(value)) ? Number(value) : String(value));
 
-function addById(id, ts, sender, text) {
+function addById(id, ts, sender, text, source = 'session') {
   const key = String(id);
   const current = byId.get(key);
-  if (!current) byId.set(key, { id: asId(key), ts, sender, text });
+  if (!current) byId.set(key, { id: asId(key), ts, sender, text, source });
   // 同一則在不同來源被裁切的長度不同，留最長的那份
   else if (text && text.length > (current.text || "").length) current.text = text;
 }
@@ -414,7 +426,14 @@ let offstageFound = false;
 // 6：平台上的歷史 —— 經由 gateway 的 `openclaw message read`
 // ---------------------------------------------------------------------------
 // 一頁要半分鐘，翻好幾頁就是好幾分鐘。`{ messages, complete }`，讀不到就是 `{ error }`。
-const platform = await readPlatform();
+const retained = channel === 'telegram' ? readTelegramHistory({ DatabaseSync, stateDir, target }) : null;
+for (const message of retained?.messages ?? []) {
+  const entry = fromPlatform(message);
+  if (entry) addById(entry.id, entry.ts, entry.sender, entry.text, 'retained');
+}
+const platform = channel === 'telegram'
+  ? { unsupported: 'Telegram 不提供伺服器歷史回溯；本機保留訊息已另行讀取。' }
+  : await readPlatform();
 
 async function readPlatform() {
   let response;
@@ -469,7 +488,7 @@ function botLabel(name) {
 }
 
 const messages = [
-  ...[...byId.values()].map((m) => ({ ...m, source: "session" })),
+  ...[...byId.values()],
   ...noId.map((m) => ({ ...m, id: null, source: "transcript" })),
 ];
 // transcript 那些沒有 id，跟已經有 id 的同一則會重複，逐字比對去掉
@@ -601,10 +620,10 @@ if (platform.messages) {
 
 // 本機一筆這個房間的紀錄都沒有：OpenClaw 從來沒在這裡收過話。平台也讀不到的話，這份汲取什麼都不代表。
 const localRecords =
-  stats.trajectoryFiles + stats.transcriptFiles + stats.rolloutFiles + (stats.sqliteSessions ?? 0) > 0 || offstage.length > 0;
+  stats.trajectoryFiles + stats.transcriptFiles + stats.rolloutFiles + (stats.sqliteSessions ?? 0) > 0 || offstage.length > 0 || (retained?.admitted ?? 0) > 0;
 const blind = !localRecords && !platform.messages;
 const warning = blind
-  ? `OpenClaw 本機沒有這個房間的任何紀錄，平台的歷史也讀不到（${platform.error}）：這份汲取看不到這個房間的對話，不代表房間是空的。`
+  ? `OpenClaw 本機沒有這個房間的任何紀錄，平台的歷史也讀不到（${platform.error || platform.unsupported}）：這份汲取看不到這個房間的對話，不代表房間是空的。`
   : null;
 
 const onPlatform = inWindow.filter((entry) => entry.source === "platform");
@@ -621,8 +640,9 @@ const coverage = {
         ...(platformFrom ? { from: platformFrom } : {}),
         ...(platform.error ? { error: platform.error } : {}),
       }
-    : { error: platform.error },
+    : platform.unsupported ? { supported: false, reason: platform.unsupported } : { error: platform.error },
   localRecords,
+  ...(retained ? { retainedTelegram: { available: retained.available, admitted: retained.admitted, skipped: retained.skipped, complete: false, ...(retained.error ? { error: retained.error } : {}) } } : {}),
   files: stats,
   offstageLog: offstageFound ? offstagePath : null,
   recovered: { withId: withId.length, transcriptOnly: merged.length - withId.length, offstageOnly: timeline.length - base.length },

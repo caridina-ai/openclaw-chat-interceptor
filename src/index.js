@@ -24,6 +24,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { guidanceForRoom } from "./ai-guidance.js";
 import {
   DEFAULT_HARNESS,
   DEFAULT_PROJECTS_FILE,
@@ -1105,7 +1106,7 @@ async function readHistory(openclaw, room, since, onPage) {
     );
     onPage();
     let batch = null;
-    let error = read.ok ? null : cliReason(read.failure);
+    let error = read.ok ? null : cliReason([read.stdout, read.failure].filter(Boolean).join('\n'));
     if (!error) {
       try {
         batch = JSON.parse(read.stdout.slice(Math.max(0, read.stdout.search(/^\{/m)))).payload?.messages;
@@ -1126,7 +1127,16 @@ async function readHistory(openclaw, room, since, onPage) {
 const messageTime = (message) => Number(message?.timestampMs) || Date.parse(message?.timestamp ?? "") || 0;
 
 /** CLI 失敗時印一大段，原因在 `Reason:` 那一行。 */
-const cliReason = (failure) => /Reason:\s*(.+)/.exec(failure)?.[1].trim() || String(failure).trim().split("\n").at(-1) || "openclaw message read failed";
+const cliReason = (failure) => {
+  const text = String(failure ?? '').trim();
+  try {
+    const start = text.search(/^\{/m);
+    const end = text.lastIndexOf('}');
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    if (parsed.error?.message) return parsed.error.message;
+  } catch {}
+  return /Reason:\s*(.+)/.exec(text)?.[1].trim() || text.split('\n').find(line => !line.startsWith('[openclaw]')) || 'openclaw message read failed';
+};
 
 /** 路由拿不到指令的 ctx：設定從 gateway 當下那一份取，取不到才用載入時的。 */
 const liveConfig = (api) => api.runtime?.config?.current?.()?.plugins?.entries?.[PLUGIN_ID]?.config ?? api.pluginConfig ?? {};
@@ -1144,7 +1154,7 @@ async function report(settings, key, entry, room, stage, message) {
     lines.push(`${name}: no FIAT`, message, `Closing ${sessionLabel(settings, entry)}.`);
   } else if (stage === "built") {
     lines.push(`${name}: built`, message);
-    const installed = await installSkill({ ...settings, name, dir: entry.dir, agent: entry.agent, installedDir: entry.installedDir });
+    const installed = await installSkill({ ...settings, name, dir: entry.dir, agent: entry.agent, installedDir: entry.installedDir, skipIdentical: true });
     if (installed.error) {
       lines.push(`not installed: ${installed.error}`);
       done.push(`not installed: ${installed.error}`);
@@ -1191,6 +1201,7 @@ export default definePluginEntry({
   description: "Runs a per-room script before the agent replies; falls through to the AI when the script declines.",
   register(api) {
     api.on("before_dispatch", (event, ctx) => beforeDispatch(api, event, ctx), { priority: 100 });
+    api.on("before_prompt_build", (_event, ctx) => guidanceForRoom(api, ctx, selectRoute));
     const channels = asideChannels(api.config);
     // 一個都沒有的話（例如只接了 Discord）就不註冊：空的白名單在 OpenClaw 眼裡是「全部」。
     if (channels.length) {

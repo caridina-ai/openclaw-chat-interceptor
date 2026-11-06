@@ -2,7 +2,7 @@
 // 訊息怎麼送、寫程式的 AI 怎麼叫。不 import openclaw 的 SDK，測試才載得起來。
 
 import { execFile } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, extname, join } from "node:path";
 
@@ -186,12 +186,17 @@ export function skillDirOf(projectDir) {
  * AI 讀的是它的 SKILL.md，route 跑的是它的 script。開發目錄之後怎麼改都不影響線上，
  * 直到再裝一次。載入 skill 是 OpenClaw 的事，plugin 只負責把 route 指到那一份。
  */
-export async function installSkill({ openclaw, interpreters, agent, name, dir, installedDir }) {
+export async function installSkill({ openclaw, interpreters, agent, name, dir, installedDir, skipIdentical = false }) {
   const skill = skillDirOf(dir);
   if (skill.error) return { error: skill.error };
   // 裝之前先確定 script 在、直譯器找得到：裝一條跑不動的 route，整個房間都會開始回錯誤訊息。
   const check = deriveRoute(interpreters, { name, dir: skill.dir });
   if (check.error) return { error: check.error };
+  // An offline official install can be reported after startup without replacing identical live files.
+  if (skipIdentical && installedDir && equalSkillTrees(skill.dir, installedDir)) {
+    const route = deriveRoute(interpreters, { name, dir: installedDir });
+    if (!route.error) return { skill: basename(installedDir), installedDir, command: route.command };
+  }
   // `--force` 是先把舊的那份搬去備份、再把新的改名進來。Windows 上改名撞到 EPERM（有程式
   // 握著那個目錄）、還原也失敗的時候，線上那份就整個不見了，房間裡每一句都找不到 script。
   // 所以自己先留一份：失敗了、而且它真的不見了，就放回去。
@@ -216,6 +221,22 @@ export async function installSkill({ openclaw, interpreters, agent, name, dir, i
   } finally {
     if (keep) rmSync(keep, { recursive: true, force: true });
   }
+}
+
+function equalSkillTrees(left, right) {
+  try {
+    if (!lstatSync(left).isDirectory() || !lstatSync(right).isDirectory()) return false;
+    const a = readdirSync(left, { withFileTypes: true });
+    const b = readdirSync(right, { withFileTypes: true });
+    if (a.length !== b.length) return false;
+    return a.every(entry => {
+      const peer = b.find(other => other.name === entry.name);
+      if (!peer || entry.isSymbolicLink() || peer.isSymbolicLink()) return false;
+      const x = join(left, entry.name), y = join(right, entry.name);
+      if (entry.isDirectory() && peer.isDirectory()) return equalSkillTrees(x, y);
+      return entry.isFile() && peer.isFile() && readFileSync(x).equals(readFileSync(y));
+    });
+  } catch { return false; }
 }
 
 /** 拿掉 installSkill 裝上去的那一份。只認 `…/skills/<名字>` 這種位置，別的一律不動。 */

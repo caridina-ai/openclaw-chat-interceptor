@@ -10,6 +10,12 @@
 
 適合固定格式、高頻出現、不需要語意判斷的指令——那些交給模型只是浪費 token。
 
+有 interceptor route 的房間交給 AI 時，外掛會透過 `before_prompt_build` 加入共同規則：有等效的既定聊天指令時，在完成操作後提醒用法；沒有就省略。房間 AI 使用既有 skill 操作資料，程式與 skill 的修改交給獨立的 `/tap` 開發流程。各 skill 不必複製這段規則。
+
+這項共用規則需要 `hooks.allowConversationAccess: true`，並保留 `hooks.allowPromptInjection` 的預設允許值；若明確設為 `false`，OpenClaw 會阻擋提示注入。
+
+`/tap` 會合併本機 session、攔截紀錄與 OpenClaw 保留的 Telegram 群組訊息；Telegram 保留訊息是本機收到且允許記錄的內容，不是伺服器完整歷史。Discord 仍可向平台分頁讀取。
+
 ## 安裝
 
 需要 OpenClaw 2026.9.6 以上（要有 `before_dispatch` hook）。
@@ -248,3 +254,5 @@ npm test
 不需要 gateway、網路、Claude Code 或 Codex。內部設計見 [docs/DESIGN.md](docs/DESIGN.md)。
 
 AI model used: Claude Opus 5.5
+
+本輪功能與修復使用 GPT-6.0（Codex）輔助開發。

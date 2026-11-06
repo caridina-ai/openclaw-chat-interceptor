@@ -1,0 +1,34 @@
+import assert from 'node:assert/strict';
+import { after, test } from 'node:test';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { register, tempDir, removeLater, TELEGRAM_CHAT, OTHER_CHAT } from './helpers.js';
+const dir = tempDir('interceptor-guidance-');
+after(() => removeLater(dir));
+test('injects shared rules for configured rooms without altering the user prompt', () => {
+  const {api,promptHook} = register();
+  api.pluginConfig = {routes:[{channel:'telegram',target:TELEGRAM_CHAT,command:['node','example.js']}]};
+  const event = {prompt:'Original request'};
+  const context = {sessionKey:`agent:main:telegram:group:${TELEGRAM_CHAT}`};
+  const result = promptHook(event,context);
+  assert.ok(result.appendSystemContext.includes('Do not modify application source code'));
+  assert.ok(result.appendSystemContext.includes('equivalent direct chat command'));
+  assert.ok(result.appendSystemContext.includes('omit the tip'));
+  assert.equal(event.prompt,'Original request');
+  assert.deepEqual(Object.keys(result),['appendSystemContext']);
+  assert.equal(promptHook(event,{sessionKey:`agent:main:telegram:group:${OTHER_CHAT}`}),undefined);
+  assert.equal(promptHook(event,{sessionKey:'agent:main:main'}),undefined);
+  api.pluginConfig.routes.push({channel:'telegram',target:'12345',command:['node','example.js']});
+  assert.ok(promptHook(event,{sessionKey:'agent:main:telegram:direct:12345'})?.appendSystemContext);
+  assert.ok(promptHook(event,{sessionKey:'agent:main:telegram:default:direct:12345'})?.appendSystemContext);
+});
+test('follows installed room mappings and removal on subsequent turns', () => {
+  const {api,promptHook} = register();
+  const projectsFile = join(dir,'projects.json');
+  api.pluginConfig = {fiat:{projectsFile}};
+  const ctx = {sessionKey:`agent:main:telegram:group:${TELEGRAM_CHAT}`};
+  writeFileSync(projectsFile,JSON.stringify({[`telegram:${TELEGRAM_CHAT}`]:{installed:true,installedDir:dir,name:'example'}}));
+  assert.ok(promptHook({},ctx)?.appendSystemContext);
+  writeFileSync(projectsFile,'{}');
+  assert.equal(promptHook({},ctx),undefined);
+});
